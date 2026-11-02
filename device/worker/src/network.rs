@@ -27,6 +27,14 @@ pub trait Transport {
 pub struct Live {
     agent: ureq::Agent,
 }
+fn credential_headers<'a>(path: &str, auth: &'a Auth) -> Option<[(&'static str, &'a str); 2]> {
+    // Refresh authenticates through its refreshToken body, matching the
+    // E-Ink client. An expired access token must not authorize /login itself.
+    (path != "/login").then_some([
+        ("vid", auth.vid.as_str()),
+        ("accessToken", auth.access_token.as_str()),
+    ])
+}
 impl Default for Live {
     fn default() -> Self {
         let tls = ureq::tls::TlsConfig::builder()
@@ -94,11 +102,10 @@ impl Transport for Live {
             ),
         ];
         let result = if method == "GET" {
-            let mut req = self
-                .agent
-                .get(&url)
-                .header("vid", &a.vid)
-                .header("accessToken", &a.access_token);
+            let mut req = self.agent.get(&url);
+            for (k, v) in credential_headers(path, a).into_iter().flatten() {
+                req = req.header(k, v);
+            }
             for (k, v) in headers {
                 req = req.header(k, v);
             }
@@ -107,9 +114,10 @@ impl Transport for Live {
             let mut req = self
                 .agent
                 .post(&url)
-                .header("vid", &a.vid)
-                .header("accessToken", &a.access_token)
                 .header("Content-Type", "application/json");
+            for (k, v) in credential_headers(path, a).into_iter().flatten() {
+                req = req.header(k, v);
+            }
             for (k, v) in headers {
                 req = req.header(k, v);
             }
@@ -145,6 +153,36 @@ impl Transport for Live {
             }
         }
         Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn refresh_omits_expired_credentials_while_reads_and_time_upload_keep_them() {
+        let auth = Auth {
+            vid: "synthetic-account".into(),
+            device_id: "independent-device".into(),
+            access_token: "expired-synthetic-token".into(),
+            refresh_token: "synthetic-refresh-body-only".into(),
+        };
+        assert_eq!(credential_headers("/login", &auth), None);
+        for path in [
+            "/book/getProgress",
+            "/readdata/detail",
+            "/config",
+            "/feature",
+            "/book/batchUploadProgress",
+        ] {
+            assert_eq!(
+                credential_headers(path, &auth),
+                Some([
+                    ("vid", "synthetic-account"),
+                    ("accessToken", "expired-synthetic-token"),
+                ])
+            );
+        }
     }
 }
 pub fn refresh<T: Transport>(transport: &mut T, root: &Path, a: &Auth) -> Result<Auth> {
