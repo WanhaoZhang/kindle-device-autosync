@@ -90,8 +90,8 @@ mv "$ROOT/package-manifest.json.repair" "$ROOT/package-manifest.json"
 changed=0
 rm "$ROOT/.component-repair"
 if [ "$enabled" = 1 ];then sh "$ROOT/install/control.sh" enable;fi
-sleep 25
-sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh authorize-prepare
+# A restarted collector deliberately starts with unknown reader state. The
+# user must really open/close a book before the separate prepare action.
 sh "$ROOT/install/control.sh" export
 printf '{"schema_version":1,"state":"components_repaired","worker_unchanged":true,"account_time_write_performed":false}\n' > "$OUT/component-repair-result.json"
 sync
