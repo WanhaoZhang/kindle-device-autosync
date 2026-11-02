@@ -1,6 +1,10 @@
 {
   "items": [
     {
+      "name": "Check preview / restore read-only / export private diagnostic",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/maintenance.sh"
+    },
+    {
       "name": "Export root compatibility probe",
       "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh probe"
     },
