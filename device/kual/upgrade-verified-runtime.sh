@@ -72,6 +72,44 @@ run_readonly() {
     done
     return 1
 }
+hardware_proof() {
+    for field in root supported_hardware supported_firmware;do [ "$(json_value "$1" "$field")" = true ] || return 1;done
+    [ "$(json_string "$1" architecture)" = arm ] && [ "$(json_string "$1" serial_prefix)" = B0D4 ]
+}
+run_selftest() {
+    test_output=$1;test_mode=$2;shift 2
+    test_attempt=1
+    while [ "$test_attempt" -le 10 ];do
+        if [ "$test_mode" = online ];then
+            [ ! -L "$OUT/tls-selftest.json" ] || return 1
+            if [ -e "$OUT/tls-selftest.json" ];then regular "$OUT/tls-selftest.json" || return 1;mv "$OUT/tls-selftest.json" "$SNAP/prior-tls-selftest-$test_attempt.json";fi
+        fi
+        test_code=0
+        if "$@" > "$SNAP/$test_output" 2> "$SNAP/$test_output.error";then :;else test_code=$?;fi
+        if [ "$test_mode" = online ];then
+            regular "$OUT/tls-selftest.json" || return 1
+            cp "$OUT/tls-selftest.json" "$SNAP/$test_output"
+        fi
+        regular "$SNAP/$test_output" && hardware_proof "$SNAP/$test_output" || return 1
+        if [ "$test_mode" = online ];then
+            [ "$(json_value "$SNAP/$test_output" network_contacted)" = true ] &&
+            [ "$(json_value "$SNAP/$test_output" https_certificate_validated)" = true ] &&
+            [ "$(json_string "$SNAP/$test_output" state)" = completed ] &&
+            [ "$(json_value "$SNAP/$test_output" tls_evidence_required)" = true ] &&
+            [ "$(json_value "$SNAP/$test_output" tls_evidence_saved)" = true ] || return 1
+        else [ "$(json_value "$SNAP/$test_output" network_contacted)" = false ] || return 1;fi
+        if [ "$test_code" = 0 ] && [ "$(json_value "$SNAP/$test_output" private_filesystem_ok)" = true ];then return 0;fi
+        [ "$(json_value "$SNAP/$test_output" private_filesystem_ok)" = false ] && [ "$test_attempt" -lt 10 ] || return 1
+        # A self-test deliberately reports FS=false without exposing its Store
+        # error. Only an immediate, independently proven busy lock permits a
+        # fresh test; an available store or any other error refuses recovery.
+        if "$PACKAGE/bin/ksync-worker" --root "$ROOT" status > "$SNAP/selftest-lock-status.json" 2> "$SNAP/selftest-lock-status.error";then return 1;fi
+        grep -Fxq 'worker stopped: worker already running' "$SNAP/selftest-lock-status.error" || return 1
+        cp "$SNAP/$test_output" "$SNAP/$test_output.failed-$test_attempt"
+        sleep 3;test_attempt=$((test_attempt+1))
+    done
+    return 1
+}
 jobs_running() {
     for job in kindle-native-sync-events kindle-native-sync;do
         state=$(initctl status "$job") || return 1
@@ -110,13 +148,46 @@ verify_sources() {
     done < "$REVIEW/sidecar-SHA256SUMS"
     [ "$metrics_count" -gt 0 ]
 }
+save_review_note() {
+    note=$ROOT/controlled-upgrade-reading-review.json
+    [ ! -L "$note" ] && [ ! -e "$note.upgrade" ] && [ ! -L "$note.upgrade" ] || return 1
+    if [ -e "$note" ];then regular "$note" && [ "$(digest "$note")" = "$(digest "$REVIEW/controlled-review.json")" ] || return 1;fi
+    cp "$REVIEW/controlled-review.json" "$note.upgrade";chmod 600 "$note.upgrade"
+    [ "$(digest "$note.upgrade")" = "$(digest "$REVIEW/controlled-review.json")" ] || return 1
+    mv "$note.upgrade" "$note"
+    sync
+}
 "$PACKAGE/bin/ksync-collector" --root "$ROOT" --repair-private-state
 jobs_running || fail 'Original native collection services are not running.'
 run_readonly old-status.json "$ROOT/bin/ksync-worker" --root "$ROOT" status
 status_proof "$SNAP/old-status.json" || fail 'Only the one reviewed legacy attempt may exist.'
-[ "$(json_value "$SNAP/old-status.json" coverage_gap)" = false ] || fail 'Existing coverage gap must be separately reviewed before any reconciliation.'
 verify_sources || fail 'Reviewed native source or sidecar changed before upgrade.'
-run_readonly local-selftest.json "$PACKAGE/bin/ksync-worker" --root "$ROOT" self-test
+case "$(json_value "$SNAP/old-status.json" coverage_gap)" in
+    false) :;;
+    true)
+        # Only an explicitly pinned independent reading-window review may
+        # acknowledge the old collector's metadata-index discontinuity. The
+        # audit does not claim byte continuity of the rotating system log.
+        [ "$(json_value "$REVIEW/controlled-review.json" allow_reviewed_preupgrade_gap_ack)" = true ] || fail 'Existing coverage gap requires an explicit pinned review.'
+        [ "$(json_string "$SNAP/old-status.json" reader_state)" = idle ] &&
+        [ "$(json_string "$SNAP/old-status.json" power_state)" = awake ] &&
+        [ "$(json_value "$SNAP/old-status.json" network_connected)" = true ] &&
+        [ "$(json_value "$SNAP/old-status.json" usb_export)" = false ] &&
+        [ "$(json_value "$SNAP/old-status.json" capture_blocked)" = false ] || fail 'Actual native state blocks the reviewed pre-upgrade acknowledgement.'
+        save_review_note || exit 1
+        "$ROOT/bin/ksync-collector" --root "$ROOT" --emit 'maintenance acknowledge-gap'
+        pre_ack_attempt=1
+        while [ "$pre_ack_attempt" -le 10 ];do
+            run_readonly old-gap-ack-status.json "$ROOT/bin/ksync-worker" --root "$ROOT" status
+            status_proof "$SNAP/old-gap-ack-status.json" || exit 1
+            if [ "$(json_value "$SNAP/old-gap-ack-status.json" coverage_gap)" = false ];then break;fi
+            [ "$pre_ack_attempt" -lt 10 ] || fail 'Old collector did not accept the reviewed acknowledgement.'
+            sleep 1;pre_ack_attempt=$((pre_ack_attempt+1))
+        done
+        verify_sources || fail 'Reviewed reading evidence changed during acknowledgement.';;
+    *) fail 'Coverage state is unavailable; no acknowledgement is permitted.';;
+esac
+run_selftest local-selftest.json local "$PACKAGE/bin/ksync-worker" --root "$ROOT" self-test
 for field in private_filesystem_ok root supported_hardware supported_firmware;do [ "$(json_value "$SNAP/local-selftest.json" "$field")" = true ] || exit 1;done
 [ "$(json_string "$SNAP/local-selftest.json" architecture)" = arm ] && [ "$(json_string "$SNAP/local-selftest.json" serial_prefix)" = B0D4 ] && [ "$(json_value "$SNAP/local-selftest.json" network_contacted)" = false ] || exit 1
 # This exact command has only GET readbacks; it never confirms/replays a POST.
@@ -170,12 +241,7 @@ mv "$ROOT/package-manifest.json.upgrade" "$ROOT/package-manifest.json"
 "$ROOT/bin/ksync-collector" --root "$ROOT" --repair-private-state
 changed=0
 rm "$ROOT/.verified-runtime-upgrade"
-note=$ROOT/controlled-upgrade-reading-review.json
-[ ! -L "$note" ] && [ ! -e "$note.upgrade" ] && [ ! -L "$note.upgrade" ] || exit 1
-if [ -e "$note" ];then regular "$note" && [ "$(digest "$note")" = "$(digest "$REVIEW/controlled-review.json")" ] || exit 1;fi
-cp "$REVIEW/controlled-review.json" "$note.upgrade";chmod 600 "$note.upgrade"
-[ "$(digest "$note.upgrade")" = "$(digest "$REVIEW/controlled-review.json")" ] || exit 1
-mv "$note.upgrade" "$note"
+save_review_note || exit 1
 sh "$ROOT/install/control.sh" enable
 start_attempt=1
 until jobs_running;do
@@ -198,7 +264,8 @@ while [ "$ack_attempt" -le 10 ];do
 done
 # Restart may retain checkpoint idle or report unknown. No reader event,
 # account authorization, plan adoption, or backlog upload is manufactured here.
-sh "$HERE/bootstrap.sh" online-self-test
+run_readonly before-tls-status.json "$ROOT/bin/ksync-worker" --root "$ROOT" status
+run_selftest online-selftest.json online sh "$HERE/bootstrap.sh" online-self-test
 sh "$ROOT/install/control.sh" export
 printf '{"schema_version":1,"state":"verified_runtime_upgraded","original_post_replayed":false,"account_time_post_performed":false,"adoption_performed":false,"review_note_preserved":true,"fresh_native_read_required":true}\n' > "$OUT/verified-runtime-upgrade-result.json"
 sync

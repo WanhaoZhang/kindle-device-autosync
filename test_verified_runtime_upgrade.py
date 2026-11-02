@@ -28,8 +28,21 @@ from pathlib import Path
 b=Path(os.environ['TEST_BASE']);command=sys.argv[3]
 with (b/'calls').open('a') as f:f.write('candidate '+command+'\\n')
 if command=='status':
+ pending=b/'selftest-failed-mode'
+ if pending.exists():
+  mode=pending.read_text();reported=b/('busy-proof-'+mode)
+  if os.environ.get('TEST_'+mode.upper()+'_FS_BUSY') and not reported.exists():
+   reported.write_text('once');print('worker stopped: worker already running',file=sys.stderr);raise SystemExit(1)
  s=json.loads((b/'old-status.json').read_text());s['reader_state']=os.environ.get('TEST_RESTART_READER','unknown');print(json.dumps(s,indent=2))
-elif command=='self-test':print(json.dumps({'private_filesystem_ok':True,'network_contacted':False,'actual_device':{'root':True,'supported_hardware':True,'supported_firmware':True,'architecture':'arm','serial_prefix':'B0D4'}},indent=2))
+elif command=='self-test':
+ online='--online-self-test' in sys.argv;mode='online' if online else 'local';counter=b/('selftest-count-'+mode)
+ n=int(counter.read_text()) if counter.exists() else 0;counter.write_text(str(n+1))
+ failed=(os.environ.get('TEST_'+mode.upper()+'_FS_BUSY') or os.environ.get('TEST_'+mode.upper()+'_FS_READY')) and n==0
+ if failed:(b/'selftest-failed-mode').write_text(mode)
+ v={'private_filesystem_ok':not failed,'network_contacted':online,'actual_device':{'root':True,'supported_hardware':True,'supported_firmware':True,'architecture':'arm','serial_prefix':'B0D4'}}
+ if online:v.update({'online_probe':{'state':'completed','https_certificate_validated':True},'tls_evidence_required':True,'tls_evidence_saved':True})
+ print(json.dumps(v,indent=2))
+ if failed:raise SystemExit(1)
 elif command=='reconcile':
  p=b/'old-status.json';s=json.loads(p.read_text());s['unknown_batches']=0;s['confirmed_seconds']=4;p.write_text(json.dumps(s,indent=2));print(json.dumps({'state':'confirmed'},indent=2))
 else:raise SystemExit(3)
@@ -42,7 +55,7 @@ else:raise SystemExit(3)
         self.tool('cp','#!'+sys.executable+'\nimport os,sys\nif os.environ.get("TEST_FAIL_WORKER_COPY") and sys.argv[-1].endswith("bin/ksync-worker.upgrade"):raise SystemExit(9)\nos.execv("/bin/cp",["/bin/cp",*sys.argv[1:]])\n')
         for pid,name in [(4242,'ksync-collector'),(4243,'ksync-event-adapter')]:
             p=self.base/'proc'/str(pid);p.mkdir(parents=True);(p/'exe').symlink_to(self.root/'bin'/name)
-        self.write(self.kual/'bootstrap.sh','#!/bin/sh\nprintf "TLS anonymous GET\\n" >> "$TEST_BASE/calls"\n')
+        self.write(self.kual/'bootstrap.sh','#!/bin/sh\nprintf "TLS anonymous GET\\n" >> "$TEST_BASE/calls"\n"$TEST_BASE/root/bin/ksync-worker" --root "$TEST_BASE/root" self-test --online-self-test > "$TEST_BASE/out/tls-selftest.json"\n')
         source=(HERE/'device/kual/upgrade-verified-runtime.sh').read_text()
         constants={line.split('=',1)[0]:line.split('=',1)[1] for line in source.splitlines() if line.startswith('LEGACY_')}
         self.legacy=hashlib.sha256((self.root/'bin/ksync-worker').read_bytes()).hexdigest()
@@ -88,6 +101,43 @@ else:raise SystemExit(3)
         self.assert_private();calls=(self.base/'calls').read_text()
         self.assertIn('maintenance acknowledge-gap',calls)
         self.assertNotIn('--emit reader',calls)
+
+    def test_explicit_pinned_review_saves_note_before_old_gap_ack_and_get(self):
+        self.policy['allow_reviewed_preupgrade_gap_ack']=True
+        (self.review/'controlled-review.json').write_text(json.dumps(self.policy,indent=2)+'\n');self.review_sums()
+        status=json.loads(self.status.read_text());status.update({'coverage_gap':True,'reader_state':'idle','power_state':'awake','network_connected':True,'usb_export':False,'capture_blocked':False});self.status.write_text(json.dumps(status,indent=2))
+        self.write(self.root/'bin/ksync-collector','#!'+sys.executable+'''\nimport json,os
+from pathlib import Path
+b=Path(os.environ['TEST_BASE']);note=b/'root/controlled-upgrade-reading-review.json'
+assert note.is_file()
+with (b/'calls').open('a') as f:f.write('preupgrade ack note=present\\n')
+p=b/'old-status.json';s=json.loads(p.read_text());s['coverage_gap']=False;p.write_text(json.dumps(s,indent=2))
+''')
+        r=self.run_upgrade();self.assertEqual(r.returncode,0,r.stderr)
+        calls=(self.base/'calls').read_text()
+        self.assertLess(calls.index('preupgrade ack note=present'),calls.index('candidate reconcile'))
+        self.assert_private();self.assertEqual((self.root/'controlled-upgrade-reading-review.json').read_bytes(),(self.review/'controlled-review.json').read_bytes())
+
+    def test_pinned_gap_review_cannot_override_active_reader(self):
+        self.policy['allow_reviewed_preupgrade_gap_ack']=True
+        (self.review/'controlled-review.json').write_text(json.dumps(self.policy,indent=2)+'\n');self.review_sums()
+        status=json.loads(self.status.read_text());status.update({'coverage_gap':True,'reader_state':'active','power_state':'awake','network_connected':True,'usb_export':False,'capture_blocked':False});self.status.write_text(json.dumps(status,indent=2))
+        self.assertNotEqual(self.run_upgrade().returncode,0)
+        self.assertFalse((self.root/'controlled-upgrade-reading-review.json').exists())
+        self.assertNotIn('acknowledge-gap',(self.base/'calls').read_text());self.assert_private()
+
+    def test_local_fs_false_needs_busy_proof_and_fresh_passing_selftest(self):
+        r=self.run_upgrade(TEST_LOCAL_FS_BUSY='1');self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual((self.base/'selftest-count-local').read_text(),'2');self.assert_private()
+
+    def test_local_fs_false_with_available_store_is_not_ignored(self):
+        self.assertNotEqual(self.run_upgrade(TEST_LOCAL_FS_READY='1').returncode,0)
+        self.assertEqual((self.base/'selftest-count-local').read_text(),'1');self.assert_old();self.assert_private()
+        self.assertNotIn('candidate reconcile',(self.base/'calls').read_text())
+
+    def test_online_fs_false_repeats_real_tls_only_with_busy_proof(self):
+        r=self.run_upgrade(TEST_ONLINE_FS_BUSY='1');self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual((self.base/'selftest-count-online').read_text(),'2');self.assert_private()
 
     def test_old_binary_or_transport_change_refuses(self):
         self.manifest['source_files_sha256']['device/worker/src/network.rs']='changed'
