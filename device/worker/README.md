@@ -33,6 +33,8 @@ ksync-worker --root DIR reconcile --plan-id PLAN_ID
 
 `collect` 需要 runtime 新鲜（120 秒以内）、reader idle 20 秒、设备 awake、非 USB 导出、capture 未阻断；不要求联网。`sync` 额外要求联网且不存在待人工核验的 capture gap。所有未知状态、缺字段、未来时间均阻断。重启后的 bootstrap 与 Mac handoff cutoff 取较晚值，避免导入首次安装以前的数据。未配置时 raw journal 仍由 collector 保留，worker 返回 `collect_only_unconfigured`，不会尝试账号请求。
 
+计时解析从该 cutoff 之后第一个真实 `ReadingTimerController:Information::OpenBook` 及其原生 `StoredBookData` 基线开始。PW2 的 `ReaderBooklet` 关书日志可能不会让上游分割 sitting；若先解析全部旧日志再丢弃跨 cutoff 的 sitting，会把后来重新开书的合法新阅读一起丢掉。本项目在解析前选择新的完整开书窗口，不按时间裁剪秒数、不制造 `CloseBook`。原始来源、指纹、精确身份及 UTC 锚仍完整保留，原有时钟、小时守恒、去重与重叠检查继续执行。cutoff 之后只有翻页却缺少新开书基线时，返回 `awaiting_post_cutoff_open=true`，保留来源并阻断清理，不能把旧会话尾部当作新阅读补传。
+
 手动 trial 的 prepare/confirm 与 `reconcile` 若发现 runtime 已超过 120 秒，会先向私有 `adapter-control.fifo` 非阻塞请求 `refresh`，核验 FIFO 类型、属主、0600 权限和打开前后 inode/device 一致，再等待 collector 真正更新 runtime；不 touch 文件或改写状态。总等待最多 6 秒，真实快照过程中短暂不安全状态最多等待 2 秒，最后仍必须通过同一 gate。reader active/unknown、无 adapter reader、符号链接或宽松权限均继续阻断。自动 sync 仍使用 collector 启动前刷新机制，不新增轮询或网络行为。
 
 ## 配置、认证和交接

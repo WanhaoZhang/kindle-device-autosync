@@ -24,6 +24,48 @@ fn buffered_counters(line: &str) -> Vec<(i64, i64, i64)> {
         .collect()
 }
 
+fn explicit_open_book(line: &str) -> bool {
+    let Some((_, module)) = line.split_once(": I ") else {
+        return false;
+    };
+    let Some(payload) = module.strip_prefix("ReadingTimerController:Information::") else {
+        return false;
+    };
+    let Some(rest) = payload.strip_prefix("OpenBook") else {
+        return false;
+    };
+    matches!(rest.as_bytes().first(), Some(b',') | Some(b';'))
+        && log::line::opened_at_counter(line).is_some()
+}
+
+/// PW2's ReaderBooklet close is not a ReadingTimerController CloseBook. The
+/// upstream parser may merge a pre-handoff sitting with a later open, so select
+/// a complete, explicitly opened window before parsing, never trim its seconds.
+/// Callers retain all raw sources, identity counters and UTC evidence separately.
+fn post_cutoff_window(mut lines: Vec<String>, cutoff: i64) -> (Vec<String>, bool) {
+    let after_cutoff = |line: &str| {
+        log::line::stamp(line)
+            .and_then(|at| epoch(&at.at).ok())
+            .is_some_and(|at| at >= cutoff)
+    };
+    if let Some(first) = lines
+        .iter()
+        .position(|line| explicit_open_book(line) && after_cutoff(line))
+    {
+        return (lines.split_off(first), false);
+    }
+    // Missing the required opening is not proof that later reading was zero.
+    // Keep these sources blocked from compaction until a real new window exists.
+    let awaiting_open = lines.iter().any(|line| {
+        after_cutoff(line)
+            && matches!(
+                log::family(line),
+                Some(log::Family::Timer | log::Family::Metric)
+            )
+    });
+    (Vec::new(), awaiting_open)
+}
+
 fn recover_buffered(
     record: &mut Record,
     cards: &[sidecar::Counter],
@@ -387,6 +429,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
             normalized.push(line);
         }
     }
+    let (normalized, awaiting_post_cutoff_open) = post_cutoff_window(normalized, effective_cutoff);
     let mut record = Record::default();
     check_cancel()?;
     record.absorb(&normalized, "");
@@ -403,7 +446,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
     // cc.db is read-only and queried only by this idle, one-shot job.
     let cc_error = remember_cc(&store.root, &mut record, ccdb).err().is_some();
     let mut inserted = 0;
-    let mut blocked = 0;
+    let mut blocked = usize::from(awaiting_post_cutoff_open);
     for s in &record.sittings {
         check_cancel()?;
         let extent = record.extent_of(s.end_position);
@@ -529,7 +572,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
         &json!({"complete":true,"blocked":blocked}),
     )?;
     Ok(
-        json!({"state":"collected","inserted_sessions":inserted,"blocked_sessions":blocked,"ccdb_unavailable":cc_error,"statistics":store.status()?}),
+        json!({"state":"collected","inserted_sessions":inserted,"blocked_sessions":blocked,"awaiting_post_cutoff_open":awaiting_post_cutoff_open,"ccdb_unavailable":cc_error,"statistics":store.status()?}),
     )
 }
 
@@ -541,6 +584,26 @@ mod tests {
         "260906:192404 cvm[6144]: I ReadingTimerController:Information::NextPage,Verdict:Processed,PageStartPos:HTMLPosition:7731097,IntervalTime:785,IntervalWords:12,TotalTime:329785,TotalWords:1905,CurrentPos:HTMLPosition:7731097,EndPos:HTMLPosition:19886489,PosLeft:12155392,%Left:0.6112;",
         "260906:192425 cvm[6144]: I ReadingTimerController:Information::NextPage,Verdict:Processed,PageStartPos:HTMLPosition:7731725,IntervalTime:21217,IntervalWords:172,TotalTime:351002,TotalWords:2077,CurrentPos:HTMLPosition:7731725,EndPos:HTMLPosition:19886489,PosLeft:12154764,%Left:0.6111;",
     ];
+    #[test]
+    fn cutoff_window_requires_the_actual_open_event_and_native_baseline() {
+        let cutoff = epoch("2026-09-06T19:24:10").unwrap();
+        let old = LOG[0].to_owned();
+        let page = LOG[2].to_owned();
+        for fake in [
+            "260906:192420 cvm: I BookTitle:Information::Title=: I ReadingTimerController:Information::OpenBook,StoredBookData:TimeRead:329 sec.;",
+            "260906:192420 cvm: I ReadingTimerController:Information::BookTitle:OpenBook,StoredBookData:TimeRead:329 sec.;",
+            "260906:192420 cvm: I ReadingTimerController:Information::OpenBook,StoredBookData:missing;",
+        ] {
+            let (lines, waiting) =
+                post_cutoff_window(vec![old.clone(), fake.into(), page.clone()], cutoff);
+            assert!(lines.is_empty());
+            assert!(waiting);
+        }
+        let open = "260906:192420 cvm: I ReadingTimerController:Information::OpenBook,StoredBookData:TimeRead:329 sec.;";
+        let (lines, waiting) = post_cutoff_window(vec![old, open.into(), page.clone()], cutoff);
+        assert_eq!(lines, vec![open.to_owned(), page]);
+        assert!(!waiting);
+    }
     #[test]
     fn buffered_only_recovers_identity_without_adding_seconds() {
         let mut r = Record::default();
@@ -651,6 +714,64 @@ mod pipeline_tests {
             .unwrap();
         assert_eq!(book, "A");
         assert_eq!(seconds, 22);
+    }
+    #[test]
+    fn handoff_cutoff_does_not_lose_later_open_on_pw2_without_closebook() {
+        let (_tmp, s, docs) = root();
+        let cutoff = epoch("2026-09-06T19:24:30").unwrap();
+        let mut config = Config::load(&s.root).unwrap();
+        config.bootstrap_cutoff_unix = cutoff;
+        atomic_json(
+            &s.root.join("config.json"),
+            &serde_json::to_value(config).unwrap(),
+        )
+        .unwrap();
+        let path = s.root.join("events/sealed/one.log");
+        let mut text = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.contains("CloseBook"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push_str("\n260906:192426 cvm: I ReaderBooklet:Information::ReaderBooklet stop\n260906:192427 cvm: I ReaderBooklet:Information::End of stop method\n260906:192459 cvm: I ReaderBooklet:Information::ReaderBooklet start\n260906:192500 cvm: I ReadingTimerController:Information::OpenBook,StoredBookData:TimeRead:351 sec. WPM:0. Version:0;\n260906:192510 cvm: I ReadingTimerController:Information::NextPage,Verdict:Processed,PageStartPos:HTMLPosition:7731725,IntervalTime:10000,IntervalWords:123,TotalTime:361002,TotalWords:2200,CurrentPos:HTMLPosition:7731725,EndPos:HTMLPosition:19886489,PosLeft:12154764,%Left:0.6111;\n260906:192511 cvm: I ReaderBooklet:Information::ReaderBooklet stop\n260906:192511 cvm: I ReaderBooklet:Information::End of stop method");
+        fs::write(&path, text).unwrap();
+        let path = docs.join("A.sdr/A.azw3f");
+        let mut raw = fs::read(&path).unwrap();
+        for (old, new) in [(351002i64, 361002i64), (2077, 2200)] {
+            let n = raw.windows(8).position(|v| v == old.to_be_bytes()).unwrap();
+            raw[n..n + 8].copy_from_slice(&new.to_be_bytes());
+        }
+        fs::write(path, raw).unwrap();
+        assert_eq!(
+            collect(&s, &docs, &s.root.join("none")).unwrap()["inserted_sessions"],
+            1
+        );
+        let body: String =
+            s.db.query_row("SELECT body FROM sessions", [], |r| r.get(0))
+                .unwrap();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["seconds"], 10);
+        assert_eq!(body["started_at"], "2026-09-06T19:25:00");
+        assert_eq!(body["counter_evidence"]["end_ms"], 361002);
+        assert_eq!(body["hours"][0]["readingTime"], 10);
+        assert_eq!(
+            collect(&s, &docs, &s.root.join("none")).unwrap()["inserted_sessions"],
+            0
+        );
+    }
+    #[test]
+    fn cutoff_inside_an_open_book_retains_sources_without_clipping_time() {
+        let (_tmp, s, docs) = root();
+        let mut runtime = private_json(&s.root.join("runtime.json")).unwrap();
+        runtime["bootstrap_unix"] = json!(epoch("2026-09-06T19:24:10").unwrap());
+        atomic_json(&s.root.join("runtime.json"), &runtime).unwrap();
+        let got = collect(&s, &docs, &s.root.join("none")).unwrap();
+        assert_eq!(got["inserted_sessions"], 0);
+        assert_eq!(got["awaiting_post_cutoff_open"], true);
+        assert_eq!(got["blocked_sessions"], 1);
+        assert_eq!(s.status().unwrap()["pending_seconds"], 0);
+        assert!(s.root.join("events/sealed/one.log").is_file());
+        assert!(compact(&s).is_err());
     }
     #[test]
     fn missing_or_duplicate_clock_evidence_cannot_create_pending_sessions() {
