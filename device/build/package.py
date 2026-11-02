@@ -30,7 +30,7 @@ def main():
     manifest={'schema_version':1,'profile':'pw2-5.12.2.1.1','firmware':'5.12.2.1.1','device_tested':False,'upload_enabled':False,'c_toolchain_profile':args.c_profile,'binaries':{}}
     source_paths = sorted(set(
         list((root/'device').rglob('*.c')) + list((root/'device').rglob('*.rs')) +
-        list((root/'device/install').rglob('*.sh')) + list((root/'device/install/upstart').glob('*.conf')) +
+        list((root/'device/install').rglob('*.sh')) + list((root/'device/ota').rglob('*.sh')) + list((root/'device/kual').rglob('*.sh')) + list((root/'device/install/upstart').glob('*.conf')) +
         [root/'device/worker/Cargo.toml', root/'device/worker/Cargo.lock']))
     # Generated Cargo build sources are not the corresponding project source.
     source_paths = [p for p in source_paths if 'target' not in p.relative_to(root).parts]
@@ -45,6 +45,7 @@ def main():
     for p in (root/'device/install').glob('*.sh'):shutil.copy2(p,out/'install'/p.name)
     for p in (root/'device/install/upstart').glob('*.conf'):shutil.copy2(p,out/'upstart'/p.name)
     shutil.copytree(root/'device/kual',out/'kual')
+    if (root/'device/ota').is_dir():shutil.copytree(root/'device/ota',out/'ota')
     shutil.copy2(root/'LICENSE',out/'LICENSE')
     shutil.copy2(root/'THIRD_PARTY_NOTICES.md',out/'THIRD_PARTY_NOTICES.md')
     shutil.copytree(root/'licenses',out/'licenses')

@@ -40,3 +40,5 @@ make test
 ```
 
 Tests compile the actual C collector and use temporary generated logs, real subprocesses, the FIFO, and a fake worker. The portable polling option allows these tests on macOS; Linux production inotify requires a separate Linux/device run. No Kindle, credentials, or network API is used.
+
+The live collector appends `KSYNC_CLOCK_V1 native_wall=YYYY-MM-DDTHH:MM:SS observed_unix=E` on explicit native book-open/close boundaries only when the native timestamp interpreted as UTC+08 agrees with its independently observed Unix clock within five seconds. Archive replays do not create witnesses; this adds no timer or fsync and never creates reading seconds. The worker must also have genuine native Journal UTC evidence, rather than trusting this witness alone.

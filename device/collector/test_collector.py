@@ -50,6 +50,25 @@ class CollectorTests(unittest.TestCase):
     def state(self):return json.loads((self.root/'runtime.json').read_text())
     def open_book(self):
         self.append(self.line('OpenBook'));self.wait(lambda:self.state()['reader_state']=='active')
+    def test_live_clock_witness_matches_native_time_and_ignores_delayed_lines(self):
+        import datetime,re
+        def native(event,tag='ReadingTimerController',delay=0):
+            stamp=time.strftime('%y%m%d:%H%M%S',time.gmtime(time.time()+28800-delay))
+            return stamp+' cvm: I '+tag+':Information::'+event+'\n'
+        self.append(native('OpenBook,StoredBookData:TimeRead:0 sec.;'))
+        self.wait(lambda:'KSYNC_CLOCK_V1' in self.data())
+        self.append(native('ReaderBooklet stop','ReaderBooklet'))
+        self.append(native('End of stop method','ReaderBooklet'))
+        self.wait(lambda:self.state()['reader_state']=='idle')
+        rows=re.findall(r'KSYNC_CLOCK_V1 native_wall=(\S+) observed_unix=(\d+)',self.data())
+        self.assertEqual(len(rows),2)
+        for wall,observed in rows:
+            epoch=datetime.datetime.fromisoformat(wall).replace(tzinfo=datetime.timezone(datetime.timedelta(hours=8))).timestamp()
+            self.assertLessEqual(abs(epoch-int(observed)),5)
+        self.append(native('OpenBook,StoredBookData:TimeRead:0 sec.;',delay=30))
+        time.sleep(.2)
+        self.assertEqual(self.data().count('KSYNC_CLOCK_V1'),2)
+
     def test_no_history_and_no_initial_mid_book_capture(self):
         self.append(self.line());time.sleep(.12);self.assertEqual(self.data(),'')
         self.open_book();self.append(self.line());self.append(self.line('CloseBook'))

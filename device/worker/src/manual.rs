@@ -1,7 +1,7 @@
 //! Manual commands request a fresh authoritative adapter snapshot only when
 //! runtime has actually expired. Never touch or synthesize runtime.json.
 use crate::*;
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use std::{
     fs,
     io::Write,
@@ -16,7 +16,7 @@ use std::{
 fn private_fifo(md: &fs::Metadata, owner: libc::uid_t) -> bool {
     md.file_type().is_fifo() && md.uid() == owner && (md.mode() & 0o777) == 0o600
 }
-fn refresh(root: &Path) -> Result<()> {
+pub(crate) fn request_refresh(root: &Path) -> Result<()> {
     check_cancel()?;
     let dir = fs::symlink_metadata(root)?;
     ensure!(
@@ -70,7 +70,7 @@ pub fn gate_manual(root: &Path, network: bool) -> Result<Runtime> {
     if !age.is_ok_and(|v| v > Duration::from_secs(120)) {
         return gate(root, network, now());
     }
-    refresh(root)?;
+    request_refresh(root)?;
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut unsafe_since = None;
     loop {
@@ -241,20 +241,16 @@ mod tests {
         fifo(t.path());
         let p = t.path().join("adapter-control.fifo");
         fs::set_permissions(&p, fs::Permissions::from_mode(0o622)).unwrap();
-        assert!(
-            gate_manual(t.path(), true)
-                .unwrap_err()
-                .to_string()
-                .contains("unsafe adapter")
-        );
+        assert!(gate_manual(t.path(), true)
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe adapter"));
         fs::rename(&p, t.path().join("real.fifo")).unwrap();
         std::os::unix::fs::symlink(t.path().join("real.fifo"), &p).unwrap();
-        assert!(
-            gate_manual(t.path(), true)
-                .unwrap_err()
-                .to_string()
-                .contains("unsafe adapter")
-        );
+        assert!(gate_manual(t.path(), true)
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe adapter"));
     }
     #[test]
     fn fresh_active_reader_never_uses_refresh_to_assume_idle() {

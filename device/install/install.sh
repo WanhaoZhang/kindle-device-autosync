@@ -19,7 +19,7 @@ ksync_storage_budget "$PACKAGE" "$free" || {
     exit 1
 }
 [ ! -L "$PACKAGE" ] || exit 1
-for path in "$STAGE" "$ROOT/bin.next" "$ROOT/bin.previous" "$ROOT/.uninstall-backup";do
+for path in "$STAGE" "$ROOT/bin.next" "$ROOT/bin.previous" "$ROOT/.uninstall-backup" "$ROOT/.preview-upgrade";do
     [ ! -e "$path" ] && [ ! -L "$path" ] || { echo 'Unreviewed project staging/rollback residue exists.' >&2;exit 1; }
 done
 (cd "$PACKAGE" && sha256sum -c SHA256SUMS) >/dev/null || { echo 'Package checksum verification failed.' >&2;exit 1; }
@@ -69,4 +69,4 @@ rm -rf "$STAGE"
 if [ "$old_components" = 0 ];then rm -rf "$BACKUP";fi
 rm -rf "$LOCK"
 transaction_active=0
-printf 'Installed: both project jobs are running in collection-only mode. New device validation is required; private ledger/auth/config retained.\n'
+printf 'Installed: both project jobs are running in collection-only mode. New device validation is required; private ledger/auth/config retained.\n' || :

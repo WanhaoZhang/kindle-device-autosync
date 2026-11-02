@@ -5,13 +5,19 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 require_device
 case "${1:-status}" in
  enable)
+    [ ! -e "$ROOT/.preview-upgrade" ] && [ ! -e "$ROOT/.install-transaction" ] || { echo 'Resolve the interrupted transaction before enabling collection.' >&2;exit 1; }
     rm -f "$ROOT/disabled"
-    start kindle-native-sync >/dev/null 2>&1 || :
-    start kindle-native-sync-events >/dev/null 2>&1 || :;;
+    for job in kindle-native-sync kindle-native-sync-events;do
+        if ! initctl status "$job" 2>/dev/null | grep -q 'start/running';then start "$job" >/dev/null 2>&1 || :;fi
+        initctl status "$job" 2>/dev/null | grep -q 'start/running' || { echo 'Collection job did not start.' >&2;exit 1; }
+    done;;
  disable)
     umask 077;mkdir -p "$ROOT";: > "$ROOT/disabled"
     stop kindle-native-sync-events >/dev/null 2>&1 || :
-    stop kindle-native-sync >/dev/null 2>&1 || :;;
+    stop kindle-native-sync >/dev/null 2>&1 || :
+    for job in kindle-native-sync-events kindle-native-sync;do
+        if initctl status "$job" 2>/dev/null | grep -q 'start/running';then echo 'Collection job did not stop.' >&2;exit 1;fi
+    done;;
  status) "$ROOT/bin/ksync-worker" --root "$ROOT" status;;
  import-config)
     "$ROOT/bin/ksync-worker" --root "$ROOT" import-config --inbox /mnt/us/.kindle-native-sync-inbox;;

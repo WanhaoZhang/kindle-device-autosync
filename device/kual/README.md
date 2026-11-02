@@ -9,3 +9,19 @@
 输出位于 USB 的 `.kindle-native-sync-export/maintenance-时间-PID/`；根目录的 `maintenance-result.json` 指向本次结果，旧 `install-result.json` 保持不变。诊断包含所有根挂载 source/type/options、原 `mntroot` 的路径、hash及不超过64KiB的脚本副本、本项目组件hash、事务标记存在状态、`initctl status` 和逐步骤退出码。日志按固定清单和长度复制，复制前后及副本的SHA必须一致。
 
 安全弹出、拔线后从 KUAL 点击一次，等待操作结束再接回 Mac。输出失败或信号中断仍会尝试不依赖 USB 输出的原生 `mntroot ro` 收尾。报告为 `needs_review` 时保留全部证据，不重复安装或删除账本。它不把旧安装失败回执改为成功，也不代表休眠、性能或微信读书入账通过验收。
+
+## Current default menu and device-only trial
+
+The pinned `5423150` maintenance action is no longer in the default menu. Its optional menu is retained as `legacy-542-menu.json`; do not add it to a new candidate's default menu, because its checksum pin intentionally rejects other packages.
+
+The current default menu provides:
+
+- **Setup stopped preview + import + reboot**: a verified low-space replacement of the disabled/unconfigured preview, local self-test, import, OTA protection, collection startup, then an explicit reboot. Keep airplane mode until the protection has been verified after that reboot.
+- **Resume imported setup + protect + reboot**: resumes after an import/guard failure; it does not roll back or erase already imported credentials or private ledger.
+- **Check protected reboot + export status**: after setup restarts the device, this checks updater backup hashes, changed boot ID and actual root read-only state, then exports ordinary status. It does not require Wi-Fi.
+- **TLS check + authorize + prepare trial**: requires OTA protection ready after reboot and existing Wi-Fi; makes an anonymous TLS probe, persists real evidence, then authorizes and prepares the specifically requested real complete session. This stage does not submit reading time.
+- **Confirm approved trial + enable if verified**: the Mac must first review the exact plan and stage a request with that immutable `plan_id`. The worker sends that one plan once; only its own confirmed book/day/position readback permits enabling experimental autosync. Unknown or unconfirmed results keep uploads disabled and retain the ledger.
+
+The Mac stages `.kindle-native-sync-actions/request.json`. The shell never parses account/plan fields: it passes the fixed directory and action to `ksync-worker operate`. The worker validates the schema, configuration binding, native device/TLS evidence, explicit experimental acceptance, real session identity and exact plan. Advanced individual authorization/prepare/confirm/enable actions remain available, but they use the same strict request contract and do not bypass it.
+
+`setup-result.json`, `action-authorize-prepare.json`, `action-confirm-enable.json`, `ota-guard.json`, `ota-status.json`, local/TLS self-test output and ordinary status exports remain in `.kindle-native-sync-export/`. A blocked command is not retried by KUAL. Do not treat a shell exit code or HTTP success as proof of account credit; the worker's private receipt and verified readbacks are authoritative.

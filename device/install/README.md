@@ -61,3 +61,18 @@ KSYNC_ZIG=/absolute/path/to/verified/zig ./device/build/build.sh --experimental-
 ```
 
 The checked-in wrappers choose distinct soft-ABI collector/adapter and hard-ABI musl SQLite targets; the hard-ABI wrapper removes only cc-rs's known incompatible `--target=arm-unknown-linux-musleabihf` argument. No wrapper downloads tools, executes on Kindle, or enables validation flags. The build requires the executable's reported version to be exactly 0.13.0. For other host architectures, use the corresponding official archive and its own published checksum.
+
+## Replacing a stopped, unconfigured preview on a small private partition
+
+`preview-upgrade.sh PACKAGE` is a separate, explicit route for the early collection-only preview. It is **not** an override for an account-enabled installation. It requires all of the following before any replacement:
+
+- A real `disabled` flag, both project Upstart jobs stopped, and no config/auth/device-acceptance file.
+- The existing worker can read its private ledger and reports zero attempts and an unconfigured state.
+- No unresolved transaction marker; the new package passes checksum and ARM32 checks.
+- The runtime/system budget still fits after exchanging old and new components.
+
+The complete old executable/script/manifest/job set is copied to `.kindle-native-sync-recovery/preview-…/` on USB and verified against hashes of the old files before private components are removed. Credentials, ledger, counters, checkpoints and captured reading logs are never moved to USB or deleted. A small private `.preview-upgrade` marker records the recovery location before cutover. New private files and jobs are read back and hashed; root is checked read-only. Collection remains disabled until the later configuration stage explicitly enables it.
+
+Controlled failures restore the complete stopped old component set from the verified USB copy. Recovery failure or interruption keeps the marker; ordinary install, enable and uninstall refuse to bypass it. After a power interruption, keep the same verified USB recovery directory and choose the explicit preview recovery action; do not delete the marker or build a fresh ledger. This is not an automatic power-loss rollback guarantee. The ordinary upgrade of configured installations retains its original full private staging/recovery budget and refuses insufficient space.
+
+KUAL `Setup stopped preview + import + reboot` then performs independent stages: replacement, local self-test, USB configuration import, OTA guard, collection enable, and an explicitly requested reboot. Once replacement succeeds its marker is cleared. If configuration import or OTA protection later fails, **new components and all mutable account/ledger state remain**, with `setup-result.json` describing the failed stage. `Resume imported setup + protect + reboot` resumes those stages after the cause is fixed, without pretending an imported account is an unconfigured preview. Setup never enables Wi-Fi and never submits reading time.

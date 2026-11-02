@@ -1,0 +1,8 @@
+{
+  "items": [
+    {
+      "name": "Check preview / restore read-only / export private diagnostic",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/maintenance.sh"
+    }
+  ]
+}

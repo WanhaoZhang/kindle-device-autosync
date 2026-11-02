@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ksync_worker::*;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -6,7 +6,7 @@ fn run() -> Result<serde_json::Value> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|s| s == "--help" || s == "-h") {
         println!(
-            "ksync-worker --root DIR self-test [--online-self-test]|collect|compact|sync|status|reconcile --plan-id ID|import-config --inbox DIR|export --out DIR\nDefault sync collects only. Manual trial: sync --trial --prepare --book-id KEY --max-seconds 60; then sync --trial --confirm --plan-id ID. Both commands do not waive device acceptance."
+            "ksync-worker --root DIR self-test [--online-self-test]|collect|compact|sync|status|reconcile --plan-id ID|import-config --inbox DIR|export --out DIR\nDefault sync collects only. Manual trial: sync --trial --prepare --book-id KEY --max-seconds 60; then sync --trial --confirm --plan-id ID. Formal acceptance or explicit experimental trial authorization is required. Preview: operate --inbox DIR --action authorize-trial|prepare|confirm|enable-experimental|disable-experimental|authorize-prepare|confirm-enable."
         );
         return Ok(json!({"state":"help"}));
     }
@@ -31,6 +31,10 @@ fn run() -> Result<serde_json::Value> {
                 "import-config",
                 "export",
                 "reconcile",
+                "operate",
+                "experimental-authorize-trial",
+                "experimental-enable",
+                "experimental-disable",
             ]
             .contains(&s.as_str())
         })
@@ -45,6 +49,24 @@ fn run() -> Result<serde_json::Value> {
     let store = Store::open(&root)?;
     match command {
         "status" => store.status(),
+        "operate" => {
+            experimental::operate(&store, Path::new(&value("--inbox")?), &value("--action")?)
+        }
+        "experimental-authorize-trial" => experimental::authorize_trial(
+            &root,
+            &Config::load(&root)?,
+            args.iter().any(|v| v == "--accept-unverified-performance"),
+        ),
+        "experimental-enable" => {
+            manual::gate_manual(&root, true)?;
+            experimental::enable(
+                &store,
+                &Config::load(&root)?,
+                &value("--plan-id")?,
+                args.iter().any(|v| v == "--accept-unverified-protocol"),
+            )
+        }
+        "experimental-disable" => experimental::disable(&root),
         "compact" => compact(&store),
         "reconcile" => {
             manual::reconcile_manual(&store, &value("--plan-id")?, &mut network::Live::default())
@@ -78,23 +100,9 @@ fn run() -> Result<serde_json::Value> {
             if !root.join("config.json").exists() {
                 return Ok(collected);
             }
-            let c = Config::load(&root)?;
-            if !c.validation.protocol_validation
-                || !c.validation.device_validation
-                || c.validation.binding_sha256 != c.binding()?
-            {
-                return Ok(
-                    json!({"state":"collect_only","collected":collected,"network_write":false}),
-                );
-            }
-            gate(&root, true, now())?;
-            device_gate(&root, &c)?;
-            let p = prepare(&store, None, false, 86400)?;
-            let Some(id) = p["plan"]["plan_id"].as_str() else {
-                return Ok(p);
-            };
-            let mut result = commit(&store, id, false, &mut network::Live::default())?;
-            if result["state"] == "confirmed" {
+            let mut result = drain(&store, &mut network::Live::default())?;
+            result["collected"] = collected;
+            if result["confirmed_batches"].as_u64().unwrap_or(0) > 0 {
                 result["compaction"] =
                     compact(&store).unwrap_or_else(|_| json!({"state":"retained"}));
             }
@@ -106,7 +114,19 @@ fn run() -> Result<serde_json::Value> {
 fn main() {
     install_signal_handlers();
     match run() {
-        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+        Ok(v) => {
+            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            let local_failed = v["private_filesystem_ok"] == false;
+            let online_failed = v["network_contacted"] == true
+                && (v["online_probe"]["state"] != "completed"
+                    || v["online_probe"]["https_certificate_validated"] != true);
+            let configured_online_proof_failed = v["network_contacted"] == true
+                && v["tls_evidence_required"] == true
+                && v["tls_evidence_saved"] != true;
+            if local_failed || online_failed || configured_online_proof_failed {
+                std::process::exit(1);
+            }
+        }
         Err(e) => {
             if e.downcast_ref::<rusqlite::Error>()
                 .is_some_and(|v| v.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))

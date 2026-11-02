@@ -428,18 +428,7 @@ static void state_reader(const char *s) {
     dirty = 1;
   }
 }
-static int process_line(const char *line, size_t n) {
-  if (!is_marker(line) || (!reading_live && old_event(line)))
-    return 0;
-  int opens = book_event(line, "OpenBook"),
-      closes = book_event(line, "CloseBook");
-  int timer = strstr(line, "ReadingTimerController") != NULL;
-  if (timer && !opens && !ever_opened)
-    return 0;
-  /* Keep reading lines only inside explicitly observed windows. BufferedLogger
-   * and UTC anchors may arrive after close. */
-  /* After a witnessed post-bootstrap open, retain late timer lines too; their
-   * event timestamps remain unchanged. */
+static int append_event(const char *line, size_t n) {
   if (!room(n)) {
     storage_blocked();
     runtime();
@@ -476,7 +465,46 @@ static int process_line(const char *line, size_t n) {
   if (free_cached >= n)
     free_cached -= n;
   dirty = 1;
+  return 0;
+}
+/* Independent live Unix-clock witness; never invents reading seconds. A
+ * delayed/archive line cannot attest its observation time. No extra fsync. */
+static void clock_witness(const char *line) {
+  struct tm local;
+  memset(&local, 0, sizeof local);
+  char *end = strptime(line, "%y%m%d:%H%M%S", &local);
+  if (end != line + 13)
+    return;
+  long long observed = nowsec();
+  long long native = (long long)timegm(&local) - 8LL * 60 * 60;
+  if (llabs(observed - native) > 5)
+    return;
+  char wall[32], witness[160];
+  if (!strftime(wall, sizeof wall, "%Y-%m-%dT%H:%M:%S", &local))
+    return;
+  int n = snprintf(witness, sizeof witness,
+      "KSYNC_CLOCK_V1 native_wall=%s observed_unix=%lld\n", wall, observed);
+  if (n > 0 && n < (int)sizeof witness)
+    (void)append_event(witness, (size_t)n);
+}
+static int process_line(const char *line, size_t n) {
+  if (!is_marker(line) || (!reading_live && old_event(line)))
+    return 0;
+  int opens = book_event(line, "OpenBook"),
+      closes = book_event(line, "CloseBook");
+  int timer = strstr(line, "ReadingTimerController") != NULL;
+  if (timer && !opens && !ever_opened)
+    return 0;
+  /* Keep reading lines only inside explicitly observed windows. BufferedLogger
+   * and UTC anchors may arrive after close. */
+  /* After a witnessed post-bootstrap open, retain late timer lines too; their
+   * event timestamps remain unchanged. */
+  if (append_event(line, n))
+    return -1;
   const char *booklet = module_payload(line, "ReaderBooklet:Information::");
+  if (reading_live && (opens || (ever_opened &&
+      (closes || exact_message(booklet, "End of stop method")))))
+    clock_witness(line);
   if (reading_live &&
       (exact_message(booklet, "ReaderBooklet start") ||
        exact_message(booklet, "Posting reader booklet starting event"))) {

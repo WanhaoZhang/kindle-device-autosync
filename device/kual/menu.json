@@ -1,8 +1,48 @@
 {
   "items": [
     {
-      "name": "Check preview / restore read-only / export private diagnostic",
-      "action": "sh /mnt/us/extensions/kindle-native-sync/maintenance.sh"
+      "name": "Setup stopped preview + import + reboot",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh setup-preview"
+    },
+    {
+      "name": "Resume imported setup + protect + reboot",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh resume-setup"
+    },
+    {
+      "name": "Check protected reboot + export status",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh verify-setup"
+    },
+    {
+      "name": "TLS check + authorize + prepare trial",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh authorize-prepare"
+    },
+    {
+      "name": "Confirm approved trial + enable if verified",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh confirm-enable"
+    },
+    {
+      "name": "Run installed online TLS check",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh online-self-test"
+    },
+    {
+      "name": "Authorize experimental trial",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh authorize-trial"
+    },
+    {
+      "name": "Prepare requested real session",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh prepare"
+    },
+    {
+      "name": "Confirm the approved trial plan",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh confirm"
+    },
+    {
+      "name": "Enable verified experimental autosync",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh enable-experimental"
+    },
+    {
+      "name": "Disable experimental uploads",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh disable-experimental"
     },
     {
       "name": "Export root compatibility probe",
@@ -11,10 +51,6 @@
     {
       "name": "Run local candidate self-test (no network)",
       "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh self-test"
-    },
-    {
-      "name": "Run candidate TLS probe (explicit network)",
-      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh tls-self-test"
     },
     {
       "name": "Install / upgrade (collection only)",
@@ -43,6 +79,10 @@
     {
       "name": "Uninstall (keep ledger)",
       "action": "sh /var/local/kindle-native-sync/install/control.sh uninstall"
+    },
+    {
+      "name": "Recover interrupted preview (keep disabled)",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh preview-recover"
     }
   ]
 }

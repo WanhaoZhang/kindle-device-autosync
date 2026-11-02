@@ -66,6 +66,176 @@ fn post_cutoff_window(mut lines: Vec<String>, cutoff: i64) -> (Vec<String>, bool
     (Vec::new(), awaiting_open)
 }
 
+#[derive(Clone, Debug)]
+struct NativeWindow {
+    lines: Vec<String>,
+    opened: String,
+    closed: String,
+}
+fn booklet_event(line: &str, event: &str) -> bool {
+    let Some((_, module)) = line.split_once(": I ") else {
+        return false;
+    };
+    let Some(payload) = module.strip_prefix("ReaderBooklet:Information::") else {
+        return false;
+    };
+    payload == event
+        || payload
+            .strip_prefix(event)
+            .is_some_and(|tail| tail.starts_with(';'))
+}
+fn explicit_close_book(line: &str) -> bool {
+    line.split_once(": I ")
+        .and_then(|(_, p)| p.strip_prefix("ReadingTimerController:Information::CloseBook"))
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with([',', ';']))
+}
+/// Split only on real lifecycle evidence, never a synthetic CloseBook. An
+/// unfinished window is retained for a later pass and cannot be compacted.
+fn native_windows(lines: &[String]) -> (Vec<NativeWindow>, bool) {
+    let mut result = Vec::new();
+    let stops: BTreeSet<String> = lines
+        .iter()
+        .filter(|l| booklet_event(l, "ReaderBooklet stop"))
+        .filter_map(|l| log::line::stamp(l).map(|s| s.at))
+        .collect();
+    let mut held: Vec<String> = Vec::new();
+    let mut opened = String::new();
+    let mut stopping = false;
+    let mut incomplete = false;
+    for line in lines {
+        if explicit_open_book(line) {
+            if !held.is_empty() {
+                incomplete = true;
+            }
+            held.clear();
+            opened = log::line::stamp(line).unwrap().at;
+            stopping = false;
+        }
+        if held.is_empty() && !explicit_open_book(line) {
+            continue;
+        }
+        held.push(line.clone());
+        if booklet_event(line, "ReaderBooklet stop") {
+            stopping = true;
+        }
+        if explicit_close_book(line)
+            || ((stopping || log::line::stamp(line).is_some_and(|s| stops.contains(&s.at)))
+                && booklet_event(line, "End of stop method"))
+        {
+            if let Some(stamp) = log::line::stamp(line) {
+                result.push(NativeWindow {
+                    lines: std::mem::take(&mut held),
+                    opened: opened.clone(),
+                    closed: stamp.at,
+                });
+            } else {
+                incomplete = true;
+                held.clear();
+            }
+            stopping = false;
+        }
+    }
+    (result, incomplete || !held.is_empty())
+}
+fn clock_witness(line: &str) -> Option<(String, i64)> {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "KSYNC_CLOCK_V1" {
+        return None;
+    }
+    let wall = fields.next()?.strip_prefix("native_wall=")?;
+    let observed: i64 = fields
+        .next()?
+        .strip_prefix("observed_unix=")?
+        .parse()
+        .ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let at = epoch(wall).ok()?;
+    if observed <= 0 || observed > now() + 5 || (observed - at).abs() > 5 {
+        return None;
+    }
+    Some((wall.into(), observed))
+}
+fn window_clock_verified(
+    anchors: &[String],
+    witnesses: &[String],
+    day: &str,
+    window: &NativeWindow,
+) -> bool {
+    if clock_verified(anchors, day) {
+        return true;
+    }
+    let Ok(open) = epoch(&window.opened) else {
+        return false;
+    };
+    let Ok(close) = epoch(&window.closed) else {
+        return false;
+    };
+    if close < open || close - open > 86400 {
+        return false;
+    }
+    let mut valid = Vec::new();
+    for line in anchors {
+        if !line.contains("JSONJournalSaver")
+            || !line.contains("annotationType=LastPositionReadAnnotation")
+        {
+            continue;
+        }
+        let Some(text) = line.get(..13) else { continue };
+        let Ok(local) = NaiveDateTime::parse_from_str(text, "%y%m%d:%H%M%S") else {
+            continue;
+        };
+        let Ok(at) = epoch(&local.format("%Y-%m-%dT%H:%M:%S").to_string()) else {
+            continue;
+        };
+        if at < open || at > close + 5 {
+            continue;
+        }
+        let Some(raw) = line.split("modificationDate=").nth(1) else {
+            continue;
+        };
+        let raw = raw.trim_start_matches('"');
+        let Some(utc) = raw.get(..19) else { continue };
+        if raw.as_bytes().get(19) != Some(&b'Z') {
+            continue;
+        }
+        let Ok(utc) = NaiveDateTime::parse_from_str(utc, "%Y-%m-%dT%H:%M:%S") else {
+            continue;
+        };
+        if (local - utc).num_seconds() != 28800 {
+            return false;
+        }
+        valid.push((at, local.date().to_string()));
+    }
+    if valid.is_empty() {
+        return false;
+    }
+    let points: Vec<_> = witnesses.iter().filter_map(|l| clock_witness(l)).collect();
+    if window.opened[..10] == window.closed[..10] {
+        return day == &window.opened[..10]
+            && valid.iter().any(|(_, d)| d == day)
+            && points
+                .iter()
+                .any(|(at, _)| at == &window.opened || at == &window.closed);
+    }
+    // A cross-midnight sitting may use its OWN closing UTC anchor plus both
+    // observed boundaries; an unrelated next-day anchor cannot authorize it.
+    if day != &window.opened[..10] && day != &window.closed[..10] {
+        return false;
+    }
+    let a = points.iter().find(|(at, _)| at == &window.opened);
+    let b = points.iter().find(|(at, _)| at == &window.closed);
+    match (a, b) {
+        (Some((_, observed_open)), Some((_, observed_close))) => {
+            valid.iter().any(|(at, _)| (*at - close).abs() <= 5)
+                && *observed_close >= *observed_open
+                && ((*observed_close - *observed_open) - (close - open)).abs() <= 10
+        }
+        _ => false,
+    }
+}
+
 fn recover_buffered(
     record: &mut Record,
     cards: &[sidecar::Counter],
@@ -410,6 +580,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
     let mut stmt = store.db.prepare("SELECT line FROM lines ORDER BY line")?;
     let mut normalized = Vec::new();
     let mut anchors = Vec::new();
+    let mut witnesses = Vec::new();
     let mut identities = BTreeSet::new();
     for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
         let line = row?;
@@ -425,11 +596,17 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
                 "memory_budget_blocked: clock window too large"
             );
         }
-        if log::family(&line).is_some() && log::line::stamp(&line).is_some() {
+        if line.starts_with("KSYNC_CLOCK_V1 ") {
+            witnesses.push(line.clone());
+        }
+        if (log::family(&line).is_some() || line.contains(": I ReaderBooklet:Information::"))
+            && log::line::stamp(&line).is_some()
+        {
             normalized.push(line);
         }
     }
     let (normalized, awaiting_post_cutoff_open) = post_cutoff_window(normalized, effective_cutoff);
+    let (windows, awaiting_close) = native_windows(&normalized);
     let mut record = Record::default();
     check_cancel()?;
     record.absorb(&normalized, "");
@@ -446,8 +623,16 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
     // cc.db is read-only and queried only by this idle, one-shot job.
     let cc_error = remember_cc(&store.root, &mut record, ccdb).err().is_some();
     let mut inserted = 0;
-    let mut blocked = usize::from(awaiting_post_cutoff_open);
-    for s in &record.sittings {
+    let mut blocked = usize::from(awaiting_post_cutoff_open || awaiting_close);
+    let mut closed_sittings = Vec::new();
+    for window in &windows {
+        let mut isolated = Record::default();
+        isolated.absorb(&window.lines, "");
+        for sitting in isolated.sittings {
+            closed_sittings.push((sitting, window));
+        }
+    }
+    for (s, window) in &closed_sittings {
         check_cancel()?;
         let extent = record.extent_of(s.end_position);
         let Some(book) = record.book_for(extent, s.asin.as_deref()) else {
@@ -469,7 +654,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
             .iter()
             .all(|(h, n)| *h <= 23 && *n >= 0 && *n <= 3600 && hours_seen.insert(h))
             && s.hours.iter().map(|(_, n)| n).sum::<i64>() == s.seconds;
-        if !valid || !clock_verified(&anchors, day) || end > now() + 5 {
+        if !valid || !window_clock_verified(&anchors, &witnesses, day, window) || end > now() + 5 {
             blocked += 1;
             continue;
         }
@@ -572,7 +757,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
         &json!({"complete":true,"blocked":blocked}),
     )?;
     Ok(
-        json!({"state":"collected","inserted_sessions":inserted,"blocked_sessions":blocked,"awaiting_post_cutoff_open":awaiting_post_cutoff_open,"ccdb_unavailable":cc_error,"statistics":store.status()?}),
+        json!({"state":"collected","inserted_sessions":inserted,"blocked_sessions":blocked,"awaiting_post_cutoff_open":awaiting_post_cutoff_open,"awaiting_explicit_close":awaiting_close,"ccdb_unavailable":cc_error,"statistics":store.status()?}),
     )
 }
 
@@ -645,6 +830,64 @@ mod tests {
             recover_buffered(&mut r, &counters, &[(19886489, 999999, 7777)]),
             0
         );
+    }
+    #[test]
+    fn one_daily_journal_needs_a_real_collector_clock_channel() {
+        let w = NativeWindow {
+            lines: vec![],
+            opened: "2026-09-06T19:24:01".into(),
+            closed: "2026-09-06T19:24:26".into(),
+        };
+        let anchors=vec!["260906:192426 cvm: I JSONJournalSaver modificationDate=2026-09-06T11:24:26Z, annotationType=LastPositionReadAnnotation".into()];
+        let witness = vec![format!(
+            "KSYNC_CLOCK_V1 native_wall={} observed_unix={}",
+            w.opened,
+            epoch(&w.opened).unwrap()
+        )];
+        assert!(window_clock_verified(&anchors, &witness, "2026-09-06", &w));
+        assert!(!window_clock_verified(&anchors, &[], "2026-09-06", &w));
+        let invalid = vec![format!(
+            "KSYNC_CLOCK_V1 native_wall={} observed_unix={}",
+            w.opened,
+            epoch(&w.opened).unwrap() + 3600
+        )];
+        assert!(!window_clock_verified(&anchors, &invalid, "2026-09-06", &w));
+        let wrong = vec![anchors[0].replace("11:24:26Z", "12:24:26Z")];
+        assert!(!window_clock_verified(&wrong, &witness, "2026-09-06", &w));
+    }
+    #[test]
+    fn cross_midnight_requires_both_own_boundaries_and_own_close_anchor() {
+        let w = NativeWindow {
+            lines: vec![],
+            opened: "2026-09-06T23:59:00".into(),
+            closed: "2026-09-07T00:02:00".into(),
+        };
+        let anchors=vec!["260907:000200 cvm: I JSONJournalSaver modificationDate=2026-09-06T16:02:00Z, annotationType=LastPositionReadAnnotation".into()];
+        let witness: Vec<_> = [&w.opened, &w.closed]
+            .map(|at| {
+                format!(
+                    "KSYNC_CLOCK_V1 native_wall={at} observed_unix={}",
+                    epoch(at).unwrap()
+                )
+            })
+            .into();
+        assert!(window_clock_verified(&anchors, &witness, "2026-09-06", &w));
+        assert!(window_clock_verified(&anchors, &witness, "2026-09-07", &w));
+        assert!(!window_clock_verified(
+            &anchors,
+            &witness[..1],
+            "2026-09-06",
+            &w
+        ));
+        let unrelated = vec![anchors[0]
+            .replace("000200", "030200")
+            .replace("16:02:00Z", "19:02:00Z")];
+        assert!(!window_clock_verified(
+            &unrelated,
+            &witness,
+            "2026-09-06",
+            &w
+        ));
     }
     #[test]
     fn clock_needs_three_distinct_exact_anchors() {
@@ -774,6 +1017,60 @@ mod pipeline_tests {
         assert!(compact(&s).is_err());
     }
     #[test]
+    fn repeated_closed_opens_of_same_book_are_separate_stable_sessions() {
+        let (_tmp, s, docs) = root();
+        let path = s.root.join("events/sealed/one.log");
+        let first=fs::read_to_string(&path).unwrap().replace("260906:192426 cvm: I ReadingTimerController:Information::CloseBook,CurrentPos:HTMLPosition:7731725,EndPos:HTMLPosition:19886489,TotalTime:351002,TotalWords:2077;","260906:192426 cvm: I ReaderBooklet:Information::ReaderBooklet stop\n260906:192426 cvm: I ReaderBooklet:Information::End of stop method");
+        fs::write(&path, first).unwrap();
+        assert_eq!(
+            collect(&s, &docs, &s.root.join("none")).unwrap()["inserted_sessions"],
+            1
+        );
+        let next = "260906:192500 cvm: I ReadingTimerController:Information::OpenBook,StoredBookData:TimeRead:351 sec. WPM:0. Version:0;\n260906:192510 cvm: I ReadingTimerController:Information::NextPage,Verdict:Processed,PageStartPos:HTMLPosition:7731725,IntervalTime:10000,IntervalWords:123,TotalTime:361002,TotalWords:2200,CurrentPos:HTMLPosition:7731725,EndPos:HTMLPosition:19886489,PosLeft:12154764,%Left:0.6111;\n260906:192511 cvm: I ReaderBooklet:Information::ReaderBooklet stop\n260906:192511 cvm: I ReaderBooklet:Information::End of stop method";
+        fs::write(s.root.join("events/sealed/two.log"), next).unwrap();
+        let sidecar = docs.join("A.sdr/A.azw3f");
+        let mut raw = fs::read(&sidecar).unwrap();
+        for (old, new) in [(351002i64, 361002i64), (2077, 2200)] {
+            let at = raw.windows(8).position(|v| v == old.to_be_bytes()).unwrap();
+            raw[at..at + 8].copy_from_slice(&new.to_be_bytes());
+        }
+        fs::write(sidecar, raw).unwrap();
+        let got = collect(&s, &docs, &s.root.join("none")).unwrap();
+        assert_eq!(got["inserted_sessions"], 1);
+        assert_eq!(got["blocked_sessions"], 0);
+        assert_eq!(s.status().unwrap()["pending_seconds"], 32);
+        assert_eq!(
+            collect(&s, &docs, &s.root.join("none")).unwrap()["inserted_sessions"],
+            0
+        );
+    }
+    #[test]
+    fn complete_cross_midnight_native_window_conserves_both_days() {
+        let (_tmp, s, docs) = root();
+        let open = "2026-09-06T23:59:30";
+        let close = "2026-09-07T00:00:31";
+        let text = format!(
+            "260906:235930 cvm: I ReadingTimerController:Information::OpenBook,StoredBookData:TimeRead:329 sec. WPM:0. Version:0;\n260906:235931 cvm: I ReadingTimerController:Information::NextPage,Verdict:Processed,PageStartPos:HTMLPosition:7731097,IntervalTime:1000,IntervalWords:5,TotalTime:330000,TotalWords:1905,CurrentPos:HTMLPosition:7731097,EndPos:HTMLPosition:19886489,PosLeft:12155392,%Left:0.6112;\n260907:000030 cvm: I ReadingTimerController:Information::NextPage,Verdict:Processed,PageStartPos:HTMLPosition:7731725,IntervalTime:59000,IntervalWords:295,TotalTime:389000,TotalWords:2200,CurrentPos:HTMLPosition:7731725,EndPos:HTMLPosition:19886489,PosLeft:12154764,%Left:0.6111;\n260907:000031 cvm: I ReaderBooklet:Information::ReaderBooklet stop\n260907:000031 cvm: I ReaderBooklet:Information::End of stop method\n260907:000031 cvm: I JSONJournalSaver modificationDate=2026-09-06T16:00:31Z, annotationType=LastPositionReadAnnotation\nKSYNC_CLOCK_V1 native_wall={open} observed_unix={}\nKSYNC_CLOCK_V1 native_wall={close} observed_unix={}",
+            epoch(open).unwrap(),
+            epoch(close).unwrap()
+        );
+        fs::write(s.root.join("events/sealed/one.log"), text).unwrap();
+        let path = docs.join("A.sdr/A.azw3f");
+        let mut raw = fs::read(&path).unwrap();
+        for (old, new) in [(351002i64, 389000i64), (2077, 2200)] {
+            let at = raw.windows(8).position(|v| v == old.to_be_bytes()).unwrap();
+            raw[at..at + 8].copy_from_slice(&new.to_be_bytes());
+        }
+        fs::write(path, raw).unwrap();
+        let result = collect(&s, &docs, &s.root.join("none")).unwrap();
+        assert_eq!(result["blocked_sessions"], 0);
+        assert_eq!(s.status().unwrap()["pending_seconds"], 60);
+        let days: i64 =
+            s.db.query_row("SELECT count(distinct day) FROM sessions", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(days, 2);
+    }
+    #[test]
     fn missing_or_duplicate_clock_evidence_cannot_create_pending_sessions() {
         let (_tmp, s, docs) = root();
         let path = s.root.join("events/sealed/one.log");
@@ -862,6 +1159,7 @@ mod pipeline_tests {
             text.push_str(&format!("\n260906:19240{i} cvm: I JSONJournalSaver modificationDate=2026-09-06T11:24:0{i}Z, annotationType=LastPositionReadAnnotation"));
         }
         text.push_str("\n260906:192500 cvm: I ReadingTimerController:Information::OpenBook,StoredBookData:TimeRead:351 sec. WPM:0. Version:0;\n260906:192529 cvm: I ReadingTimerController:Information::NextPage,Verdict:Processed,PageStartPos:HTMLPosition:7731725,IntervalTime:28998,IntervalWords:1023,TotalTime:380000,TotalWords:3100,CurrentPos:HTMLPosition:7731725,EndPos:HTMLPosition:19886489,PosLeft:12154764,%Left:0.6111;");
+        text.push_str("\n260906:192530 cvm: I ReaderBooklet:Information::ReaderBooklet stop\n260906:192530 cvm: I ReaderBooklet:Information::End of stop method");
         fs::write(s.root.join("events/sealed/two.log"), text).unwrap();
         let path = docs.join("A.sdr/A.azw3f");
         let mut raw = fs::read(&path).unwrap();

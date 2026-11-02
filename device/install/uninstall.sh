@@ -5,6 +5,7 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$HERE/common.sh"
 . "$HERE/transaction.sh"
 require_device
+[ ! -e "$ROOT/.preview-upgrade" ] || { echo 'Resolve the interrupted preview replacement before uninstalling.' >&2;exit 1; }
 BACKUP="$ROOT/.uninstall-backup"
 # Do not overwrite an active or incomplete upgrade's recovery evidence.
 [ ! -e "$ROOT/.install-transaction" ] && [ ! -L "$ROOT/.install-transaction" ] || { echo 'Resolve the previous transaction before uninstalling.' >&2;exit 1; }

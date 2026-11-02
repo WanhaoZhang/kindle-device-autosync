@@ -1,14 +1,15 @@
 //! One-shot device worker. No UI, no background thread, no wake/Wi-Fi control.
 //! SPDX-License-Identifier: AGPL-3.0-only
+pub mod experimental;
 pub mod manual;
 pub mod network;
 pub mod parsing;
 pub mod protocol;
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use chrono::{Datelike, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -560,11 +561,15 @@ impl Store {
             Ok(c) => {
                 let binding = c.binding()?;
                 let bound = c.validation.binding_sha256 == binding;
-                let device =
-                    c.validation.device_validation && bound && device_gate(&self.root, &c).is_ok();
+                let device = c.validation.device_validation
+                    && bound
+                    && formal_device_gate(&self.root, &c).is_ok();
                 let protocol = c.validation.protocol_validation && bound;
                 let authenticated = Auth::load(&self.root, &c).is_ok();
-                let enabled = device && protocol && authenticated;
+                let preview = experimental::status(&self.root, &c);
+                let enabled = ((device && protocol) || preview["automatic_authorized"] == true)
+                    && authenticated;
+                out["experimental"] = preview;
                 out["configured"] = json!(true);
                 out["authenticated"] = json!(authenticated);
                 out["account_hash"] = json!(c.account_hash());
@@ -661,7 +666,7 @@ pub fn actual_device() -> Value {
         .unwrap_or_default();
     json!({"architecture":std::env::consts::ARCH,"serial_prefix":prefix,"supported_hardware":prefix=="B0D4","supported_firmware":firmware.is_some(),"kernel_release":kernel,"root":unsafe{libc::geteuid()}==0})
 }
-pub fn device_gate(root: &Path, c: &Config) -> Result<()> {
+pub fn formal_device_gate(root: &Path, c: &Config) -> Result<()> {
     let probe = actual_device();
     ensure!(
         probe["architecture"] == "arm"
@@ -688,6 +693,13 @@ pub fn device_gate(root: &Path, c: &Config) -> Result<()> {
         ensure!(evidence[k] == true, "device acceptance evidence incomplete");
     }
     Ok(())
+}
+
+pub fn device_gate(root: &Path, c: &Config) -> Result<()> {
+    if formal_device_gate(root, c).is_ok() {
+        return Ok(());
+    }
+    experimental::preview_gate(root, c, false)
 }
 
 pub fn day_snapshot(v: &Value, day: &str) -> Result<i64> {
@@ -792,10 +804,20 @@ pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64)
     let mut stmt = store
         .db
         .prepare("SELECT body FROM sessions WHERE state='pending' ORDER BY day,id")?;
-    let all: Vec<Value> = stmt
+    let mut all: Vec<Value> = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .map(|r| Ok(serde_json::from_str(&r?)?))
         .collect::<Result<_>>()?;
+    if trial {
+        // Validate the newest whole observed window, not an older short
+        // window accidentally selected by its source hash.
+        all.sort_by(|a, b| {
+            b["started_at"]
+                .as_str()
+                .cmp(&a["started_at"].as_str())
+                .then_with(|| b["ended_at"].as_str().cmp(&a["ended_at"].as_str()))
+        });
+    }
     let mut chosen = Vec::new();
     let mut group: Option<(String, String)> = None;
     for s in all {
@@ -855,6 +877,9 @@ pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64)
     let hours:Vec<Value>=hours.into_iter().map(|(epoch,seconds)|json!({"startOfHour":epoch,"timeZone":"+08:00","readingTime":seconds,"ttsTime":0})).collect();
     let seconds: i64 = chosen.iter().map(|s| s["seconds"].as_i64().unwrap()).sum();
     let mut plan = json!({"schema_version":1,"created_unix":now(),"trial":trial,"binding_sha256":c.binding()?,"account_hash":c.account_hash(),"local_book_id":local,"weread_book_id":mapping.weread_book_id,"title":mapping.title,"day":day,"seconds":seconds,"hours":hours,"sessions":chosen});
+    if trial {
+        experimental::bind_trial_plan(&store.root, &c, &mut plan);
+    }
     let id = sha(plan.to_string());
     plan["plan_id"] = json!(id);
     storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
@@ -879,6 +904,7 @@ fn verify_plan(store: &Store, c: &Config, plan: &Value, trial: bool) -> Result<(
         "mapping changed"
     );
     if trial {
+        experimental::verify_preview_trial_plan(&store.root, c, plan)?;
         ensure!(
             plan["sessions"]
                 .as_array()
@@ -915,10 +941,13 @@ pub fn commit_verified<T: network::Transport>(
     store.bind(&c)?;
     let mut a = Auth::load(&store.root, &c)?;
     gate(&store.root, true, now())?;
+    let unresolved:i64=store.db.query_row("SELECT count(*) FROM attempts WHERE state IN ('dispatching','unknown','needs_review','failed')",[],|r|r.get(0))?;
     ensure!(
-        c.validation.device_validation
-            && c.validation.binding_sha256 == c.binding()?
-            && (trial || c.validation.protocol_validation),
+        unresolved == 0,
+        "unresolved write blocks new account submissions"
+    );
+    ensure!(
+        experimental::write_authorized(&store.root, &c, trial),
         "acceptance gates disabled"
     );
     let (state, body): (String, String) =
@@ -994,9 +1023,7 @@ pub fn commit_verified<T: network::Transport>(
     let current = Config::load(&store.root)?;
     ensure!(
         current.binding()? == c.binding()?
-            && current.validation.device_validation
-            && (trial || current.validation.protocol_validation)
-            && current.validation.binding_sha256 == current.binding()?,
+            && experimental::write_authorized(&store.root, &current, trial),
         "configuration changed during preflight"
     );
     verify_plan(store, &c, &plan, trial)?;
@@ -1088,6 +1115,68 @@ pub fn commit<T: network::Transport>(
     let c = Config::load(&store.root)?;
     device_gate(&store.root, &c)?;
     commit_verified(store, id, trial, transport)
+}
+
+/// Drain older book/day groups while the actual reader remains idle and the
+/// existing network stays connected. Each plan owns exactly one POST; uncertain
+/// results stop the entire drain and are never automatically replayed.
+pub fn drain<T: network::Transport>(store: &Store, transport: &mut T) -> Result<Value> {
+    drain_loop(store, transport, true)
+}
+fn drain_loop<T: network::Transport>(
+    store: &Store,
+    transport: &mut T,
+    physical: bool,
+) -> Result<Value> {
+    let mut batches = 0u64;
+    let mut seconds = 0i64;
+    loop {
+        if check_cancel().is_err() {
+            return Ok(
+                json!({"state":"paused","reason":"cancelled","confirmed_batches":batches,"confirmed_seconds":seconds}),
+            );
+        }
+        let c = Config::load(&store.root)?;
+        if !experimental::write_authorized(&store.root, &c, false) {
+            return Ok(
+                json!({"state":"collect_only","network_write":false,"confirmed_batches":batches,"confirmed_seconds":seconds}),
+            );
+        }
+        if physical {
+            device_gate(&store.root, &c)?;
+        }
+        if manual::gate_manual(&store.root, true).is_err() {
+            return Ok(
+                json!({"state":"paused","reason":"device_not_idle_awake_connected","confirmed_batches":batches,"confirmed_seconds":seconds}),
+            );
+        }
+        let unresolved:i64=store.db.query_row("SELECT count(*) FROM attempts WHERE state IN ('dispatching','unknown','needs_review','failed')",[],|r|r.get(0))?;
+        if unresolved > 0 {
+            return Ok(
+                json!({"state":"needs_review","reason":"unresolved_write","confirmed_batches":batches,"confirmed_seconds":seconds}),
+            );
+        }
+        let p = prepare(store, None, false, 86400)?;
+        let Some(id) = p["plan"]["plan_id"].as_str() else {
+            return Ok(
+                json!({"state":"drained_or_blocked","confirmed_batches":batches,"confirmed_seconds":seconds,"remaining":p}),
+            );
+        };
+        let result = if physical {
+            commit(store, id, false, transport)?
+        } else {
+            commit_verified(store, id, false, transport)?
+        };
+        if result["state"] != "confirmed" {
+            return Ok(
+                json!({"state":"needs_review","confirmed_batches":batches,"confirmed_seconds":seconds,"last_result":result}),
+            );
+        }
+        batches += 1;
+        seconds += result["seconds"]
+            .as_i64()
+            .context("missing confirmed duration")?;
+    }
 }
 
 pub fn export(store: &Store, destination: &Path) -> Result<Value> {
@@ -1503,6 +1592,30 @@ mod tests {
         );
     }
     #[test]
+    fn trial_selects_newest_complete_window_while_auto_keeps_backlog() {
+        let (_t, s, _) = fixture();
+        let body: String =
+            s.db.query_row("SELECT body FROM sessions WHERE id='session-a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut newer: Value = serde_json::from_str(&body).unwrap();
+        newer["id"] = json!("session-z-new");
+        newer["started_at"] = json!("2026-11-01T22:14:12");
+        newer["ended_at"] = json!("2026-11-01T22:14:25");
+        s.db.execute(
+            "INSERT INTO sessions VALUES ('session-z-new','A','2026-11-01',13000,26000,200,'pending',?)",
+            [newer.to_string()],
+        )
+        .unwrap();
+        let trial = prepare(&s, Some("A"), true, 60).unwrap();
+        assert_eq!(trial["plan"]["sessions"][0]["id"], "session-z-new");
+        assert_eq!(trial["plan"]["seconds"], 13);
+        let backlog = prepare(&s, None, false, 60).unwrap();
+        assert_eq!(backlog["plan"]["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(backlog["plan"]["seconds"], 26);
+    }
+    #[test]
     fn empty_record_is_narrowly_recognized() {
         assert_eq!(
             position(&json!({"book":{"recordReadingTime":0}}), "B")
@@ -1677,6 +1790,131 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+    #[test]
+    fn automatic_drain_uploads_multiple_books_and_days_without_resending() {
+        #[derive(Default)]
+        struct Multi {
+            books: std::collections::BTreeMap<String, i64>,
+            days: std::collections::BTreeMap<i64, i64>,
+            posts: usize,
+        }
+        impl Transport for Multi {
+            fn request(
+                &mut self,
+                method: &str,
+                path: &str,
+                query: &[(&str, String)],
+                body: Option<&Value>,
+                _: &Auth,
+            ) -> std::result::Result<Value, NetError> {
+                match path {
+                    "/book/getProgress" => {
+                        let bid = &query.iter().find(|(k, _)| *k == "bookId").unwrap().1;
+                        Ok(
+                            json!({"bookId":bid,"timestamp":now(),"book":{"readingTime":100+self.books.get(bid).copied().unwrap_or(0),"progress":10,"chapterUid":2,"chapterOffset":7}}),
+                        )
+                    }
+                    "/config" => Ok(json!({"token":"synthetic"})),
+                    "/feature" => Ok(json!({})),
+                    "/readdata/detail" => {
+                        let at: i64 = query
+                            .iter()
+                            .find(|(k, _)| *k == "baseTime")
+                            .unwrap()
+                            .1
+                            .parse()
+                            .unwrap();
+                        let local = zone().timestamp_opt(at, 0).unwrap();
+                        let midnight = at - local.time().num_seconds_from_midnight() as i64;
+                        let base = midnight - local.weekday().num_days_from_monday() as i64 * 86400;
+                        let days: serde_json::Map<String, Value> = self
+                            .days
+                            .iter()
+                            .filter(|(k, _)| **k >= base && **k < base + 604800)
+                            .map(|(k, v)| (k.to_string(), json!(v)))
+                            .collect();
+                        Ok(json!({"baseTime":base,"readTimes":days}))
+                    }
+                    "/book/batchUploadProgress" if method == "POST" => {
+                        self.posts += 1;
+                        let b = &body.unwrap()["books"][0];
+                        *self
+                            .books
+                            .entry(b["bookId"].as_str().unwrap().into())
+                            .or_default() += b["readingTime"].as_i64().unwrap();
+                        for h in b["hours"].as_array().unwrap() {
+                            let at = h["startOfHour"].as_i64().unwrap();
+                            let day = (at + 28800).div_euclid(86400) * 86400 - 28800;
+                            *self.days.entry(day).or_default() +=
+                                h["readingTime"].as_i64().unwrap();
+                        }
+                        Ok(json!({"succ":1}))
+                    }
+                    _ => Err(NetError::Invalid),
+                }
+            }
+        }
+        use chrono::Timelike;
+        let (_t, s, mut c) = fixture();
+        c.validation.protocol_validation = true;
+        c.mappings.push(Mapping {
+            local_book_id: "B".into(),
+            weread_book_id: "second-book".into(),
+            title: "Second synthetic book".into(),
+        });
+        c.validation.binding_sha256 = c.binding().unwrap();
+        atomic_json(
+            &s.root.join("config.json"),
+            &serde_json::to_value(&c).unwrap(),
+        )
+        .unwrap();
+        let mut b: Value = serde_json::from_str(
+            &s.db
+                .query_row("SELECT body FROM sessions", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+        )
+        .unwrap();
+        b["id"] = json!("session-b");
+        b["local_book_id"] = json!("B");
+        b["day"] = json!("2026-11-02");
+        b["started_at"] = json!("2026-11-02T09:00:00");
+        b["ended_at"] = json!("2026-11-02T09:00:07");
+        b["seconds"] = json!(7);
+        b["hours"] = json!([{"startOfHour":epoch("2026-11-02T09:00:00").unwrap(),"timeZone":"+08:00","readingTime":7,"ttsTime":0}]);
+        s.db.execute(
+            "INSERT INTO sessions VALUES ('session-b','B','2026-11-02',0,7000,101,'pending',?)",
+            [b.to_string()],
+        )
+        .unwrap();
+        let mut transport = Multi::default();
+        let result = drain_loop(&s, &mut transport, false).unwrap();
+        assert_eq!(result["confirmed_batches"], 2);
+        assert_eq!(result["confirmed_seconds"], 20);
+        assert_eq!(transport.posts, 2);
+        let again = drain_loop(&s, &mut transport, false).unwrap();
+        assert_eq!(again["confirmed_batches"], 0);
+        assert_eq!(transport.posts, 2);
+    }
+    #[test]
+    fn automatic_drain_stops_after_first_uncertain_post() {
+        let (_t, s, mut c) = fixture();
+        c.validation.protocol_validation = true;
+        c.validation.binding_sha256 = c.binding().unwrap();
+        atomic_json(
+            &s.root.join("config.json"),
+            &serde_json::to_value(c).unwrap(),
+        )
+        .unwrap();
+        let mut transport = Mock {
+            mode: "ack_only",
+            ..Default::default()
+        };
+        let result = drain_loop(&s, &mut transport, false).unwrap();
+        assert_eq!(result["state"], "needs_review");
+        assert_eq!(transport.posts, 1);
+        drain_loop(&s, &mut transport, false).unwrap();
+        assert_eq!(transport.posts, 1);
     }
     #[test]
     fn model_prefix_reads_exactly_four_bytes_without_reading_serial_tail() {
@@ -1958,6 +2196,12 @@ pub fn self_test(root: &Path, online: bool) -> Value {
             Ok(v) => v,
             Err(_) => json!({"state":"failed","certificate_validation_disabled":false}),
         };
+        let saved = (|| -> Result<()> {
+            let c = Config::load(root)?;
+            experimental::record_live_tls(root, &c, &actual_device(), &out["online_probe"])
+        })();
+        out["tls_evidence_saved"] = json!(saved.is_ok());
+        out["tls_evidence_required"] = json!(root.join("config.json").exists());
     }
     out
 }
