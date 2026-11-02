@@ -749,6 +749,15 @@ static int cmp_names(const void *a, const void *b) {
     return 1;
   return strcmp(*(char *const *)a, *(char *const *)b);
 }
+/* Firmware rotation counters contain bare digits, not syslog records. Their
+ * atomic replacement must not be interpreted as a lost partial reading line. */
+static int rotation_index_path(const char *path) {
+  const char *base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  return !strcmp(base, "messages_aggregate") ||
+         !strcmp(base, "messages_oldest") ||
+         !strcmp(base, "messages_youngest");
+}
 static void scan_dir(const char *dir, int first) {
   DIR *d = opendir(dir);
   if (!d)
@@ -757,7 +766,8 @@ static void scan_dir(const char *dir, int first) {
   int count = 0;
   struct dirent *e;
   while ((e = readdir(d)) && count < MAX_CURSORS) {
-    if (strncmp(e->d_name, logbase, strlen(logbase)))
+    if (strncmp(e->d_name, logbase, strlen(logbase)) ||
+        rotation_index_path(e->d_name))
       continue;
     char *p = malloc(PATH_CAP);
     if (!p)
@@ -847,6 +857,10 @@ static void load_checkpoint(void) {
     if (fscanf(f, "%llu %llu %llu %llu %d %4095[^\n]\n", &c->dev, &c->ino,
                &c->off, &c->gz_size, &c->gz_done, c->path) != 6)
       break;
+    /* Earlier previews included these control files. Drop only those known
+     * non-log cursors; retain every real coverage warning and log cursor. */
+    if (rotation_index_path(c->path))
+      continue;
     nc++;
   }
   fclose(f); /* Never trust stale network/power observations after process

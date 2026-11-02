@@ -50,6 +50,35 @@ class CollectorTests(unittest.TestCase):
     def state(self):return json.loads((self.root/'runtime.json').read_text())
     def open_book(self):
         self.append(self.line('OpenBook'));self.wait(lambda:self.state()['reader_state']=='active')
+    def test_rotation_index_replacement_is_not_a_reading_gap(self):
+        self.open_book()
+        indexes=('messages_aggregate','messages_oldest','messages_youngest')
+        for name in indexes:(self.rotated/name).write_text('00000127')
+        time.sleep(.16)
+        for name in indexes:
+            replacement=self.rotated/(name+'.new')
+            replacement.write_text('00000128')
+            replacement.replace(self.rotated/name)
+        time.sleep(.22)
+        self.assertFalse(self.state()['coverage_gap'])
+        self.append(self.line(suffix='TotalTime:27123,TotalWords:177;'))
+        self.wait(lambda:'27123' in self.data())
+        self.stop()
+        saved=(self.root/'collector.checkpoint').read_text()
+        for name in indexes:self.assertNotIn(name,saved)
+
+    def test_legacy_index_cursors_are_pruned_without_clearing_real_gaps(self):
+        self.stop()
+        checkpoint=self.root/'collector.checkpoint'
+        with checkpoint.open('a') as f:
+            for name in ('messages_aggregate','messages_oldest','messages_youngest'):
+                f.write('0 9999 8 0 0 '+str(self.rotated/name)+'\n')
+        self.start()
+        self.assertFalse(self.state()['coverage_gap'])
+        self.event('rescan now')
+        self.assertTrue(self.state()['coverage_gap'])
+        self.stop();self.start()
+        self.assertTrue(self.state()['coverage_gap'])
     def test_live_clock_witness_matches_native_time_and_ignores_delayed_lines(self):
         import datetime,re
         def native(event,tag='ReadingTimerController',delay=0):

@@ -99,7 +99,7 @@ PW2 的真实关书尾计数可能与 EndStop 同一秒，按文本排序会将�
 
 复用 ReadingLog 的解析、counted 模型和小时分配；BufferedLogger 延迟内容只补精确身份，不增加秒数。副文件统计索引按文件 inode/尺寸/mtime 缓存。cc.db 以只读方式打开并缓存，仅为已精确识别的 sidecar/内容键补标题；不使用文件字节大小猜测 HTMLPosition，不改变已识别的 source key。旧日志仍要求同日三条去重后的 JournalSaver UTC+08 锚。新采集器的 `KSYNC_CLOCK_V1 native_wall=... observed_unix=...` 时钟见证必须与按 +08:00 换算的原生日志时间相差不超过 5 秒；同一完整阅读窗口至少还需一条真实 JournalSaver UTC 锚，不能仅凭采集器自证。跨午夜窗口必须同时具有自身开书/关书两端见证及自身关书 UTC 锚，才能核验两日小时分配；无证据的数据继续保留并阻断。
 
-每个 plan 在网络写入前持久 claim 为 `dispatching`；之后仅发送一个 POST，再最多两个 GET 回读。认证只在写前 GET 预检阶段续期一次，核对同 vid 并原子保存。POST 后不续期、不重发。仅在单书累计量、正确日期总量和位置均满足预期时确认。`reconcile` 仅对明确收到成功回执的 needs_review 批次做 GET 核验，不续期、不 POST。
+每个 plan 在时长写入前持久 claim 为 `dispatching`；之后仅发送一个时长 POST，再按下述有限轮次做 GET 回读。认证在新上传预检或独立对账查询阶段最多续期一次，核对同 vid 并原子保存。已发出时长 POST 的当前回读阶段不续期、不重发。仅在单书累计量、正确日期总量和位置均满足预期时确认。`reconcile` 仅对明确收到成功回执的 needs_review 批次查询核验；过期认证可经一次同账号 `/login` 续期，但绝不发送或重放时长 POST。
 
 SIGTERM/SIGINT 只设置取消标记：发送前退出，已 claim 进入发送边界则允许当前一个 POST 与两个有限 GET 收尾，再退出。单请求 HTTP budget 20 秒，此阶段最多三次请求，不阻止系统睡眠；真实断电/强制 kill 留下 dispatching 仍阻断重放。
 

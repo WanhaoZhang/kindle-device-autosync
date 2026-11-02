@@ -2129,6 +2129,63 @@ mod tests {
         assert_eq!(m.calls.len(), before);
     }
     #[test]
+    fn separate_readonly_reconcile_renews_expired_auth_once_without_time_post() {
+        let (_t, s, c) = fixture();
+        let id = plan(&s);
+        let mut m = Mock {
+            mode: "day_only",
+            ..Default::default()
+        };
+        commit_verified(&s, &id, true, &mut m).unwrap();
+        m.total = 13;
+        m.auth_fail_once = true;
+        let before = m.calls.len();
+        let receipt = reconcile(&s, &id, &mut m).unwrap();
+        assert_eq!(receipt["state"], "confirmed");
+        assert_eq!(receipt["after"]["seconds"], 113);
+        assert_eq!(receipt["day_after"], 13);
+        assert_eq!(m.refreshes, 1);
+        assert_eq!(m.posts, 1);
+        assert_eq!(
+            m.calls[before..],
+            [
+                "GET /book/getProgress",
+                "POST /login",
+                "GET /book/getProgress",
+                "GET /readdata/detail"
+            ]
+        );
+        assert_eq!(Auth::load(&s.root, &c).unwrap().access_token, "fresh");
+    }
+    #[test]
+    fn readonly_reconcile_wrong_account_refresh_stops_without_saving_or_replaying() {
+        let (_t, s, c) = fixture();
+        let id = plan(&s);
+        let mut m = Mock {
+            mode: "day_only",
+            ..Default::default()
+        };
+        commit_verified(&s, &id, true, &mut m).unwrap();
+        m.total = 13;
+        m.mode = "wrong_account";
+        m.auth_fail_once = true;
+        let before = m.calls.len();
+        assert!(reconcile(&s, &id, &mut m).is_err());
+        assert_eq!(m.calls[before..], ["GET /book/getProgress", "POST /login"]);
+        assert_eq!(m.posts, 1);
+        assert_eq!(m.refreshes, 1);
+        assert_eq!(
+            Auth::load(&s.root, &c).unwrap().access_token,
+            "synthetic-access"
+        );
+        assert_eq!(
+            s.db.query_row("SELECT state FROM attempts WHERE id=?", [&id], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "needs_review"
+        );
+    }
+    #[test]
     fn database_has_explicit_four_mib_ceiling() {
         let (_t, s, _) = fixture();
         assert_eq!(
@@ -2553,7 +2610,8 @@ mod tests {
     }
 }
 
-/// Read-only reconciliation. Even authentication renewal is forbidden here.
+/// Separate read-only reconciliation. One identity-checked token renewal is
+/// allowed for these GETs; the original time POST is never sent again.
 pub fn reconcile<T: network::Transport>(
     store: &Store,
     id: &str,
@@ -2562,7 +2620,7 @@ pub fn reconcile<T: network::Transport>(
     gate(&store.root, true, now())?;
     let c = Config::load(&store.root)?;
     store.bind(&c)?;
-    let a = Auth::load(&store.root, &c)?;
+    let mut a = Auth::load(&store.root, &c)?;
     let (state, text): (String, String) =
         store
             .db
@@ -2587,19 +2645,24 @@ pub fn reconcile<T: network::Transport>(
     );
     let bid = plan["weread_book_id"].as_str().context("missing book")?;
     let date = plan["day"].as_str().context("missing date")?;
+    let mut refreshed = false;
     let after = position(
-        &transport.request(
-            "GET",
+        &network::preflight(
+            transport,
+            &store.root,
+            &mut a,
+            &mut refreshed,
             "/book/getProgress",
             &[("bookId", bid.into())],
-            None,
-            &a,
         )?,
         bid,
     )?;
     let day_after = day_snapshot(
-        &transport.request(
-            "GET",
+        &network::preflight(
+            transport,
+            &store.root,
+            &mut a,
+            &mut refreshed,
             "/readdata/detail",
             &[
                 ("mode", "weekly".into()),
@@ -2611,8 +2674,6 @@ pub fn reconcile<T: network::Transport>(
                         .to_string(),
                 ),
             ],
-            None,
-            &a,
         )?,
         date,
     )?;
