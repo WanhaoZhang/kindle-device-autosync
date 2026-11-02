@@ -21,6 +21,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "../install/private-permissions.h"
 #ifdef __linux__
 #include <sys/inotify.h>
 #include <sys/syscall.h>
@@ -96,6 +97,12 @@ static int mkdir_private(const char *p) {
     return -1;
   }
   return 0;
+}
+/* Repair the typed project whitelist at startup and immediately before worker
+ * exec. Firmware may widen /var/local after startup. Operate on opened inodes,
+ * never follow symlinks or recurse into unknown paths. */
+static int restrict_worker_root(void) {
+  return ksync_restrict_private_state(root, geteuid());
 }
 static void fsyncdir(const char *p) {
   int fd = open(p, O_RDONLY | O_DIRECTORY);
@@ -950,6 +957,10 @@ static void maybe_worker(void) {
     return;
   worker = fork();
   if (worker == 0) {
+    if (restrict_worker_root()) {
+      perror("private worker root");
+      _exit(126);
+    }
     execl(exe, exe, "--root", root, mode, (char *)NULL);
     _exit(127);
   }
@@ -959,12 +970,17 @@ static void maybe_worker(void) {
 static void usage(void) {
   fprintf(stderr,
           "ksync-collector [--root DIR] [--log FILE] [--emit 'power awake'] "
-          "[--queue-bytes N] [--reserve-bytes N] [--poll-ms N (test only)]\n");
+          "[--repair-private-state] [--queue-bytes N] [--reserve-bytes N] [--poll-ms N (test only)]\n");
   exit(2);
 }
 int main(int argc, char **argv) {
   char *emit = NULL;
+  int repair_only = 0;
   for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--repair-private-state")) {
+      repair_only = 1;
+      continue;
+    }
     if (i + 1 >= argc)
       usage();
     char *k = argv[i++], *v = argv[i];
@@ -991,6 +1007,12 @@ int main(int argc, char **argv) {
   /* Never retain a userstore cwd across USB mass-storage export. */
   if (chdir("/"))
     die("safe cwd");
+  if (repair_only) {
+    if (emit || restrict_worker_root())
+      die("private state repair");
+    puts("{\"schema_version\":1,\"state\":\"private_permissions_verified\",\"contents_changed\":false}");
+    return 0;
+  }
   char fifo[PATH_CAP];
   join(fifo, root, "control.fifo");
   if (emit) {
@@ -1009,7 +1031,9 @@ int main(int argc, char **argv) {
     return 0;
   }
   umask(0077);
-  if (mkdir_private(root))
+  if (mkdir(root, 0700) && errno != EEXIST)
+    die("private root create");
+  if (restrict_worker_root() || mkdir_private(root))
     die("private root");
   char p[PATH_CAP];
   join(p, root, "events");

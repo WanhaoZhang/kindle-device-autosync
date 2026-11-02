@@ -122,6 +122,24 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('cancellation: passed',result.stdout)
 
+    def test_root_permission_repair_is_fd_based_and_does_not_recurse(self):
+        source=Path(__file__).resolve().parent/'test_root_permissions.c'
+        unit=self.path/'root-permission-tests'
+        subprocess.run([os.environ.get('CC','cc'),'-O2','-std=c11','-Wall','-Wextra','-Werror',str(source),'-o',str(unit)],check=True)
+        home=self.path/'root-unit';home.mkdir(mode=0o700)
+        result=subprocess.run([str(unit),str(home)],capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+
+        self.stop();self.root.chmod(0o755);self.start()
+        self.assertEqual(self.root.stat().st_mode & 0o777,0o700)
+        self.stop();self.root.chmod(0o2770)
+        config=self.root/'config.json';config.write_text('synthetic fixture');config.chmod(0o660)
+        result=subprocess.run([str(BINARY),'--root',str(self.root),'--repair-private-state'],capture_output=True,text=True,timeout=3)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['state'],'private_permissions_verified')
+        self.assertEqual(config.read_text(),'synthetic fixture')
+        self.assertEqual(config.stat().st_mode & 0o7777,0o600)
+
     def test_startup_and_respawn_request_adapter_state_replay(self):
         path=self.root/'adapter-control.fifo';os.mkfifo(path,0o600)
         fd=os.open(path,os.O_RDWR|os.O_NONBLOCK);self.addCleanup(os.close,fd)
@@ -133,15 +151,19 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(os.read(fd,100),b'refresh\n')
         self.assertEqual(self.state()['bootstrap_unix'],boot)
         self.assertEqual(self.state()['reader_state'],'unknown')
-    def test_adapter_handshake_rejects_symlinks_and_loose_permissions(self):
+    def test_adapter_handshake_rejects_symlinks_and_repairs_owned_loose_fifo(self):
         channel=self.root/'adapter-control.fifo';other=self.root/'real-adapter.fifo'
         os.mkfifo(other,0o600);fd=os.open(other,os.O_RDWR|os.O_NONBLOCK);self.addCleanup(os.close,fd)
-        channel.symlink_to(other);self.stop();self.start()
+        channel.symlink_to(other);self.stop()
+        result=subprocess.run([str(BINARY),'--root',str(self.root),'--log',str(self.log),'--poll-ms','40'],capture_output=True,text=True,timeout=3)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('private root',result.stderr)
         with self.assertRaises(BlockingIOError):os.read(fd,100)
         channel.unlink();os.mkfifo(channel,0o600);channel.chmod(0o640)
         fd2=os.open(channel,os.O_RDWR|os.O_NONBLOCK);self.addCleanup(os.close,fd2)
         self.stop();self.start()
-        with self.assertRaises(BlockingIOError):os.read(fd2,100)
+        self.assertEqual(channel.stat().st_mode & 0o7777,0o600)
+        self.assertEqual(os.read(fd2,100),b'refresh\n')
 
     def test_single_instance_lock(self):
         r=subprocess.run([str(BINARY),'--root',str(self.root),'--log',str(self.log),'--poll-ms','40'],capture_output=True,timeout=2)

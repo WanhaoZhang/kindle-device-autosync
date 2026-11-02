@@ -20,6 +20,20 @@ require_device() {
     [ "$prefix" = B0D4 ] || { echo 'Unsupported model prefix.' >&2; exit 1; }
     [ ! -L "$ROOT" ] || { echo 'Private root must not be a symlink.' >&2; exit 1; }
 }
+# Explicit startup/enable repair only. Read-only probes must not call this.
+# Firmware startup can reset modes of existing /var/local directories; the
+# worker deliberately refuses a root with any group/other permission bits.
+repair_private_root() {
+    [ "$(id -u)" = 0 ] || return 1
+    [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || return 1
+    ksync_root_owner=$(stat -c '%u' "$ROOT" 2>/dev/null) || return 1
+    [ "$ksync_root_owner" = 0 ] || return 1
+    # Never recurse: preserve credential, queue, checkpoint and ledger modes.
+    chmod 700 "$ROOT" || return 1
+    [ -d "$ROOT" ] && [ ! -L "$ROOT" ] || return 1
+    [ "$(stat -c '%u' "$ROOT" 2>/dev/null)" = 0 ] || return 1
+    [ "$(stat -c '%a' "$ROOT" 2>/dev/null)" = 700 ] || return 1
+}
 space_kib() { df -Pk /var/local | awk 'END {print $4}'; }
 # The stock helper can log a failed remount and still exit zero. Ignore the
 # rootfs pseudo entry; require all real root entries to agree on exactly ro/rw.

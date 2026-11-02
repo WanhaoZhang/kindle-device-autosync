@@ -290,15 +290,27 @@ printf '%s\n' "$value"
         self.assertEqual(self.process.pid,old_pid);self.assertIsNone(self.process.poll())
         self.assertEqual(len(self.queries()),before+4)
 
-    def test_adapter_control_rejects_symlink_and_world_writable_fifo(self):
+    def test_adapter_control_rejects_symlink_and_repairs_owned_broad_fifo(self):
         path=self.root/'adapter-control.fifo'
         target=self.root/'other';target.write_text('do not change')
         path.symlink_to(target)
         self.process=subprocess.Popen([str(self.binary),str(self.root),str(self.commands)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         self.assertEqual(self.process.wait(timeout=3),1);self.assertEqual(target.read_text(),'do not change')
         path.unlink();self.os.mkfifo(path,0o600);path.chmod(0o666)
-        self.process=subprocess.Popen([str(self.binary),str(self.root),str(self.commands)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        self.assertEqual(self.process.wait(timeout=3),1)
+        self.start()
+        self.assertEqual(path.stat().st_mode & 0o7777,0o600)
+
+    def test_refresh_repairs_firmware_widened_root_and_channels(self):
+        self.start();before=len(self.queries())
+        self.root.chmod(0o2770)
+        for name in ('control.fifo','adapter-control.fifo'):(self.root/name).chmod(0o660)
+        commands=self.os.open(self.root/'adapter-control.fifo',self.os.O_WRONLY|self.os.O_NONBLOCK)
+        try:self.os.write(commands,b'refresh\n')
+        finally:self.os.close(commands)
+        self.wait_for(lambda:len(self.queries())==before+4)
+        self.assertEqual(self.root.stat().st_mode & 0o7777,0o700)
+        for name in ('control.fifo','adapter-control.fifo'):
+            self.assertEqual((self.root/name).stat().st_mode & 0o7777,0o600)
 
 
 

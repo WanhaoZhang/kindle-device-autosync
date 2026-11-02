@@ -29,7 +29,7 @@ def main():
     inputs={'ksync-collector':args.collector,'ksync-worker':args.worker,'ksync-event-adapter':args.adapter}
     manifest={'schema_version':1,'profile':'pw2-5.12.2.1.1','firmware':'5.12.2.1.1','device_tested':False,'upload_enabled':False,'c_toolchain_profile':args.c_profile,'binaries':{}}
     source_paths = sorted(set(
-        list((root/'device').rglob('*.c')) + list((root/'device').rglob('*.rs')) +
+        list((root/'device').rglob('*.c')) + list((root/'device').rglob('*.h')) + list((root/'device').rglob('*.rs')) +
         list((root/'device/install').rglob('*.sh')) + list((root/'device/ota').rglob('*.sh')) + list((root/'device/kual').rglob('*.sh')) + list((root/'device/install/upstart').glob('*.conf')) +
         [root/'device/worker/Cargo.toml', root/'device/worker/Cargo.lock']))
     # Generated Cargo build sources are not the corresponding project source.

@@ -19,6 +19,7 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
+#include "private-permissions.h"
 
 static const char *root="/var/local/kindle-native-sync";
 static volatile sig_atomic_t quit=0;
@@ -50,9 +51,11 @@ static int capture(const char *source,const char *property,char *out,size_t size
 }
 
 static int emit(const char *line){
+    if(ksync_restrict_control_channels(root,owner))return -1;
     char path[512];snprintf(path,sizeof path,"%s/control.fifo",root);
     struct stat s;if(lstat(path,&s)||!S_ISFIFO(s.st_mode)||s.st_uid!=owner||(s.st_mode&077))return -1;
     int fd=open(path,O_WRONLY|O_NONBLOCK|O_NOFOLLOW);if(fd<0)return -1;
+    if(fstat(fd,&s)||!S_ISFIFO(s.st_mode)||s.st_uid!=owner||(s.st_mode&077)){close(fd);return -1;}
     size_t len=strlen(line);ssize_t n=write(fd,line,len);close(fd);
     return n==(ssize_t)len?0:-1;
 }
@@ -75,6 +78,7 @@ static void refresh_usb(void){
 static void refresh_all(void){refresh_usb();refresh_power();refresh_network();}
 static int control_channel(void){
     char path[512];struct stat s;
+    if(ksync_restrict_control_channels(root,owner))return -1;
     if(lstat(root,&s)||!S_ISDIR(s.st_mode)||s.st_uid!=owner||(s.st_mode&077))return -1;
     snprintf(path,sizeof path,"%s/adapter-control.fifo",root);
     if(mkfifo(path,0600)&&errno!=EEXIST)return -1;

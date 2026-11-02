@@ -27,7 +27,7 @@ class InstallTransactions(unittest.TestCase):
             body=p.read_text().replace('JOBS=/etc/upstart','JOBS='+str(self.jobs))
             (self.install/p.name).write_text(body)
         common=(SOURCE/'common.sh').read_text().replace('ROOT=/var/local/kindle-native-sync','ROOT='+str(self.root)).replace('/proc/mounts',str(self.base/'root-mounts')).replace('/bin/mount -n', 'false -n').replace('sleep 1', ':')
-        common+='\nrequire_device() { :; }\nspace_kib() { printf "131072\\n"; }\n'
+        common+='\nrequire_device() { :; }\nrepair_private_root() { chmod 700 "$ROOT"; }\nspace_kib() { printf "131072\\n"; }\n'
         (self.install/'common.sh').write_text(common)
         for name in ('ksync-collector','ksync-worker','ksync-event-adapter'):
             body=bytearray(64);body[:7]=b'\x7fELF\x01\x01\x01';body[18:20]=b'\x28\x00'
