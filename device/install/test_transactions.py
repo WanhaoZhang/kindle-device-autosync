@@ -26,8 +26,8 @@ class InstallTransactions(unittest.TestCase):
         for p in SOURCE.glob('*.sh'):
             body=p.read_text().replace('JOBS=/etc/upstart','JOBS='+str(self.jobs))
             (self.install/p.name).write_text(body)
-        common=(SOURCE/'common.sh').read_text().replace('ROOT=/var/local/kindle-native-sync','ROOT='+str(self.root))
-        common+='\nrequire_device() { :; }\nspace_kib() { printf \"131072\\n\"; }\nroot_rw() { fake-mount rw; }\nroot_ro() { fake-mount ro; }\n'
+        common=(SOURCE/'common.sh').read_text().replace('ROOT=/var/local/kindle-native-sync','ROOT='+str(self.root)).replace('/proc/mounts',str(self.base/'root-mounts'))
+        common+='\nrequire_device() { :; }\nspace_kib() { printf "131072\\n"; }\n'
         (self.install/'common.sh').write_text(common)
         for name in ('ksync-collector','ksync-worker','ksync-event-adapter'):
             body=bytearray(64);body[:7]=b'\x7fELF\x01\x01\x01';body[18:20]=b'\x28\x00'
@@ -42,8 +42,10 @@ with (base/'calls').open('a') as log:log.write(json.dumps([name,*args])+'\\n')
 failure=os.environ.get('TEST_FAIL','');marker=base/('failed-'+failure.replace('/','_'))
 def fail_once(condition):
  if condition and not marker.exists():marker.write_text('once');raise SystemExit(9)
-if name=='fake-mount':
- fail_once(failure=='mount_'+args[0]);(base/'root-mode').write_text(args[0]);raise SystemExit(0)
+if name=='mntroot':
+ fail_once(failure=='mount_'+args[0])
+ if failure=='mount_'+args[0]+'_lies' and not marker.exists():marker.write_text('once');raise SystemExit(0)
+ (base/'root-mode').write_text(args[0]);(base/'root-mounts').write_text('rootfs / rootfs rw 0 0\\n/dev/test / ext3 '+args[0]+',noatime 0 0\\n');raise SystemExit(0)
 if name=='cp':
  # Inject failure after staging has completed and active files are being applied.
  fail_once(failure=='copy_stage' and '/.install-stage/' in args[-1])
@@ -77,11 +79,12 @@ if name=='initctl':
  fail_once(failure=='reload');raise SystemExit(0)
 raise SystemExit(1)
 '''
-        for name in ('fake-mount','cp','mv','sync','sha256sum','status','start','stop','initctl'):
+        for name in ('mntroot','cp','mv','sync','sha256sum','status','start','stop','initctl'):
             p=self.commands/name;p.write_text(tool);p.chmod(0o700)
         self.private={'auth.json':'PRIVATE_AUTH','config.json':'PRIVATE_CONFIG','ledger.sqlite':'PRIVATE_LEDGER','other-data':'PRIVATE_DATA'}
         for name,body in self.private.items():(self.root/name).write_text(body)
         (self.base/'root-mode').write_text('ro')
+        (self.base/'root-mounts').write_text('rootfs / rootfs rw 0 0\n/dev/test / ext3 ro,noatime 0 0\n')
 
     def old(self,collector=True,events=True):
         (self.root/'bin').mkdir();(self.root/'bin/ksync-worker').write_text('OLD WORKER')
@@ -130,7 +133,7 @@ raise SystemExit(1)
         r=self.execute();self.assertNotEqual(r.returncode,0);self.assertEqual((backup/'bin/ksync-worker').read_text(),'OLD WORKER')
 
     def test_upgrade_mount_copy_reload_and_start_failure_restore_every_old_component(self):
-        for failure in ['mount_rw','copy_backup','copy_stage','copy_job','mount_ro','reload','start_collector']:
+        for failure in ['mount_rw','mount_rw_lies','copy_backup','copy_stage','copy_job','mount_ro','mount_ro_lies','reload','start_collector']:
             with self.subTest(failure=failure):
                 # Separate fixtures avoid leaking mocked failure history across phases.
                 case=InstallTransactions('test_upgrade_preserves_one_complete_old_set_and_invalidates_active_acceptance');case.setUp()
@@ -210,6 +213,61 @@ raise SystemExit(1)
             self.assertFalse((self.root/name).exists(),name)
         self.assertEqual((self.root/'validation-device.json').read_text(),'OLD EVIDENCE')
         self.assertEqual(list(self.jobs.iterdir()),[])
+
+
+class RootMountPostconditions(unittest.TestCase):
+    """Actual production mount guards with a private proc snapshot and native stub."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.base=Path(self.tmp.name);self.mounts=self.base/'mounts';self.calls=self.base/'calls'
+        self.commands=self.base/'commands';self.commands.mkdir()
+        self.native_code=self.base/'native-exit';self.native_code.write_text('0')
+        tool=self.commands/'mntroot'
+        tool.write_text('#!/bin/sh\nprintf \'%s\\n\' "$1" >> '+str(self.calls)+'\nexit "$(cat '+str(self.native_code)+')"\n')
+        tool.chmod(0o700)
+        self.common=self.base/'common.sh'
+        self.common.write_text((SOURCE/'common.sh').read_text().replace('/proc/mounts',str(self.mounts)))
+        self.env={**os.environ,'PATH':str(self.commands)+':/usr/bin:/bin'}
+
+    def run_guard(self,entries,guard='root_ro',native=0):
+        self.mounts.write_text(entries);self.native_code.write_text(str(native))
+        return subprocess.run(['sh','-c','. "$1"; "$2"','guard',str(self.common),guard],env=self.env,text=True,capture_output=True,timeout=3)
+
+    def test_zero_native_exit_cannot_hide_root_remaining_writable(self):
+        r=self.run_guard('rootfs / rootfs rw 0 0\n/dev/root / ext3 rw,noatime 0 0\n')
+        self.assertEqual(r.returncode,1);self.assertIn('observed=read_write',r.stderr)
+        self.assertIn('native_exit=0',r.stderr);self.assertEqual(self.calls.read_text(),'ro\n')
+
+    def test_rootfs_rw_does_not_override_real_root_ro(self):
+        r=self.run_guard('/dev/root / ext3 ro,noatime 0 0\nrootfs / rootfs rw 0 0\n')
+        self.assertEqual(r.returncode,0,r.stderr)
+        state=self.run_guard('/dev/root / ext3 ro 0 0\nrootfs / rootfs rw 0 0\n','ksync_root_mount_state')
+        self.assertEqual(state.stdout,'read_only\n')
+
+    def test_nonzero_native_exit_is_allowed_only_with_verified_target(self):
+        r=self.run_guard('/dev/root / ext3 ro,noatime 0 0\n',native=1)
+        self.assertEqual(r.returncode,0,r.stderr);self.assertIn('exit=1',r.stderr)
+        r=self.run_guard('/dev/root / ext3 rw,noatime 0 0\n','root_rw',native=9)
+        self.assertEqual(r.returncode,0,r.stderr);self.assertIn('read_write',r.stderr)
+
+    def test_unknown_or_contradictory_real_roots_are_rejected(self):
+        cases=['rootfs / rootfs rw 0 0\n',
+               '/dev/root / ext3 noatime 0 0\n',
+               '/dev/root / ext3 ro,rw 0 0\n',
+               '/dev/root / ext3 ro 0 0\n/dev/other / ext3 rw 0 0\n']
+        for entries in cases:
+            with self.subTest(entries=entries):
+                r=self.run_guard(entries);self.assertEqual(r.returncode,1)
+                self.assertIn('observed=unknown',r.stderr)
+        self.mounts.unlink()
+        r=subprocess.run(['sh','-c','. "$1"; ksync_root_mount_state','guard',str(self.common)],env=self.env,text=True,capture_output=True,check=True)
+        self.assertEqual(r.stdout,'unknown\n')
+
+    def test_writable_guard_requires_all_real_roots_to_be_writable(self):
+        r=self.run_guard('/dev/root / ext3 ro,noatime 0 0\n','root_rw')
+        self.assertEqual(r.returncode,1);self.assertIn('desired=read_write',r.stderr)
+        r=self.run_guard('/dev/root / ext3 rw 0 0\n/dev/other / ext3 rw,nodev 0 0\n','root_rw')
+        self.assertEqual(r.returncode,0,r.stderr)
 
 
 if __name__=='__main__':unittest.main()

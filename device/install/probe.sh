@@ -26,10 +26,8 @@ clock_unix=$(date +%s 2>/dev/null || :)
 case "$clock_unix" in ''|*[!0-9]*) clock_unix=0;; esac
 clock_local=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null | tr -cd '0-9T:+Z-')
 clock_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null | tr -cd '0-9T:+Z-')
-# The last '/' mount is the real root mount after the kernel rootfs entry.
-root_flags=$(awk '$2=="/" {flags=$4} END {print flags}' /proc/mounts 2>/dev/null || :)
-root_mount_state=unknown
-case ",$root_flags," in *,ro,*) root_mount_state=read_only;; *,rw,*) root_mount_state=read_write;; esac
+# Share the installer's conservative real-root mount classification.
+root_mount_state=$(ksync_root_mount_state)
 # Only fixed public state properties; never read network profiles, SSIDs or secrets.
 power_state=$(lipc-get-prop com.lab126.powerd state 2>/dev/null || :)
 case "$power_state" in active|screenSaver|readyToSuspend|suspend|suspended|suspending|sleep|resuming|hibernate) :;; *) power_state=unknown;; esac

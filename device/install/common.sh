@@ -21,8 +21,45 @@ require_device() {
     [ ! -L "$ROOT" ] || { echo 'Private root must not be a symlink.' >&2; exit 1; }
 }
 space_kib() { df -Pk /var/local | awk 'END {print $4}'; }
-root_rw() { command -v mntroot >/dev/null 2>&1 && mntroot rw >/dev/null; }
-root_ro() { command -v mntroot >/dev/null 2>&1 && mntroot ro >/dev/null; }
+# The stock helper can log a failed remount and still exit zero. Ignore the
+# rootfs pseudo entry; require all real root entries to agree on exactly ro/rw.
+ksync_root_mount_state() {
+    if ksync_mount_scan=$(awk '
+    $2=="/" && $3!="rootfs" {
+        n++;ro=0;rw=0;count=split($4,options,",");
+        for(i=1;i<=count;i++) {if(options[i]=="ro") ro++;if(options[i]=="rw") rw++;}
+        if(ro==1 && rw==0) reads++;
+        else if(rw==1 && ro==0) writes++;
+        else bad++;
+    }
+    END {
+        if(n>0 && bad==0 && reads==n) print "read_only";
+        else if(n>0 && bad==0 && writes==n) print "read_write";
+        else print "unknown";
+    }' /proc/mounts 2>/dev/null);then
+        printf '%s\n' "$ksync_mount_scan"
+    else
+        printf 'unknown\n'
+    fi
+}
+ksync_set_root_mount() {
+    case "$1" in ro) ksync_mount_wanted=read_only;; rw) ksync_mount_wanted=read_write;; *) return 1;; esac
+    ksync_mntroot_exit=127
+    if command -v mntroot >/dev/null 2>&1;then
+        if mntroot "$1" >/dev/null;then ksync_mntroot_exit=0;else ksync_mntroot_exit=$?;fi
+    fi
+    ksync_mount_observed=$(ksync_root_mount_state)
+    if [ "$ksync_mount_observed" = "$ksync_mount_wanted" ];then
+        if [ "$ksync_mntroot_exit" != 0 ];then
+            printf 'Native mntroot exit=%s; kernel root mount verified as %s.\n' "$ksync_mntroot_exit" "$ksync_mount_observed" >&2
+        fi
+        return 0
+    fi
+    printf 'Root mount transition not verified: desired=%s observed=%s native_exit=%s.\n' "$ksync_mount_wanted" "$ksync_mount_observed" "$ksync_mntroot_exit" >&2
+    return 1
+}
+root_rw() { ksync_set_root_mount rw; }
+root_ro() { ksync_set_root_mount ro; }
 
 # PW2 private-partition budget, all units KiB. Keep in sync with device worker/
 # collector guards: raw 4 MiB, DB 4 MiB, journal 4 MiB + 64 KiB, system 20 MiB.

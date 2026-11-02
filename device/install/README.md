@@ -20,6 +20,10 @@ This still requires real-device tests: event subscriptions, USB transitions, ful
 
 The adapter also owns private `adapter-control.fifo` (0600, root-owned, symlinks rejected). Every collector startup requests `refresh\n` after it opens its own control FIFO and publishes runtime state. This forces a full authoritative snapshot and replays unchanged power/network/USB state after collector respawn; it does not rely on Upstart restarting the adapter and does not add timer polling. The root probe also checks the firmware `gzip` utility, used only for idle catch-up of rotated native logs.
 
+## Root mount verification
+
+The installer and compatibility probe share the same kernel mount-state check. The firmware native `mntroot` helper may return zero even when its remount failed, so its return code alone never proves success. After requesting `rw` or `ro`, installation requires every non-`rootfs` `/` entry in `/proc/mounts` to have the requested state. Mixed, malformed or missing real-root entries are rejected. A native nonzero exit is reported but does not fail an operation whose requested mount state is independently verified. The always-writable `rootfs` pseudo entry is not the on-disk system partition.
+
 ## Upgrade, rollback and removal
 
 Install/upgrade stages the complete new binaries, installation scripts, manifest and jobs before replacing active components. `upgrade.previous` keeps one complete old set: binaries, installation scripts, manifest, optional CA, device-acceptance evidence, jobs and their previous running states. A further upgrade refuses to overwrite an unreviewed recovery set or transaction residue. Copy/remount/reload/start failures restore the old set and previous service state, then restore root read-only; incomplete recovery retains evidence and refuses guessed cleanup. An already-running adapter started by Upstart is accepted, not treated as a failed second start.
