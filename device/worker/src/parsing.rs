@@ -102,13 +102,34 @@ fn native_windows(lines: &[String]) -> (Vec<NativeWindow>, bool) {
     let mut opened = String::new();
     let mut stopping = false;
     let mut incomplete = false;
+    let mut closed: Option<String> = None;
     for line in lines {
+        let stamp = log::line::stamp(line).unwrap().at;
+        // SQL stores deduplicated lines in lexical order. At one native clock
+        // second, EndStop sorts before its real final PageStartPos counter.
+        // Finish the timestamp group, retaining the actual close timestamp.
+        if closed.as_ref().is_some_and(|at| at != &stamp) {
+            result.push(NativeWindow {
+                lines: std::mem::take(&mut held),
+                opened: opened.clone(),
+                closed: closed.take().unwrap(),
+            });
+            stopping = false;
+        }
         if explicit_open_book(line) {
+            if closed.is_some() {
+                // A new open in the same second as close has no trustworthy
+                // ordering after deduplication. Keep it blocked, never guess.
+                incomplete = true;
+                held.clear();
+                closed = None;
+                continue;
+            }
             if !held.is_empty() {
                 incomplete = true;
             }
             held.clear();
-            opened = log::line::stamp(line).unwrap().at;
+            opened = stamp.clone();
             stopping = false;
         }
         if held.is_empty() && !explicit_open_book(line) {
@@ -122,18 +143,15 @@ fn native_windows(lines: &[String]) -> (Vec<NativeWindow>, bool) {
             || ((stopping || log::line::stamp(line).is_some_and(|s| stops.contains(&s.at)))
                 && booklet_event(line, "End of stop method"))
         {
-            if let Some(stamp) = log::line::stamp(line) {
-                result.push(NativeWindow {
-                    lines: std::mem::take(&mut held),
-                    opened: opened.clone(),
-                    closed: stamp.at,
-                });
-            } else {
-                incomplete = true;
-                held.clear();
-            }
-            stopping = false;
+            closed = Some(stamp);
         }
+    }
+    if let Some(at) = closed {
+        result.push(NativeWindow {
+            lines: std::mem::take(&mut held),
+            opened,
+            closed: at,
+        });
     }
     (result, incomplete || !held.is_empty())
 }
@@ -487,6 +505,90 @@ pub fn verify_manifest(root: &Path, body: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Correct only an unsent prefix of this exact closed window. Immutable source
+/// proofs and pending ownership must still hold; sent/uncertain rows never move.
+fn unsent_tail_plans(
+    store: &Store,
+    previous: &Value,
+    state: &str,
+    next: &Value,
+) -> Result<Option<Vec<String>>> {
+    let old = &previous["counter_evidence"];
+    let new = &next["counter_evidence"];
+    if state != "pending"
+        || previous["local_book_id"] != next["local_book_id"]
+        || previous["day"] != next["day"]
+        || previous["started_at"] != next["started_at"]
+        || previous["bootstrap_cutoff_unix"] != next["bootstrap_cutoff_unix"]
+        || old["extent"] != new["extent"]
+        || old["start_ms"] != new["start_ms"]
+        || old["start_words"] != new["start_words"]
+        || !old["end_ms"]
+            .as_i64()
+            .zip(new["end_ms"].as_i64())
+            .is_some_and(|(a, b)| b > a)
+        || !old["end_words"]
+            .as_i64()
+            .zip(new["end_words"].as_i64())
+            .is_some_and(|(a, b)| b >= a)
+        || !previous["seconds"]
+            .as_i64()
+            .zip(next["seconds"].as_i64())
+            .is_some_and(|(a, b)| a > 0 && b >= a)
+        || !previous["ended_at"]
+            .as_str()
+            .zip(next["ended_at"].as_str())
+            .is_some_and(|(a, b)| b >= a)
+    {
+        return Ok(None);
+    }
+    let old_sources = previous["sources"]
+        .as_array()
+        .context("missing old sources")?;
+    let new_sources = next["sources"].as_array().context("missing new sources")?;
+    if old_sources.is_empty() || !old_sources.iter().all(|p| new_sources.contains(p)) {
+        return Ok(None);
+    }
+    verify_manifest(&store.root, previous)?;
+    let id = previous["id"]
+        .as_str()
+        .context("missing prior session id")?;
+    let direct_attempts: i64 = store.db.query_row(
+        "SELECT count(*) FROM attempts WHERE EXISTS(SELECT 1 FROM json_each(body,'$.plan.sessions') WHERE json_extract(value,'$.id')=?1) OR EXISTS(SELECT 1 FROM json_each(body,'$.sessions') WHERE json_extract(value,'$.id')=?1)",
+        [id], |r| r.get(0))?;
+    if direct_attempts != 0 {
+        return Ok(None);
+    }
+    let mut q = store.db.prepare("SELECT id,state,body FROM plans")?;
+    let mut plans = Vec::new();
+    for row in q.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (plan_id, plan_state, text) = row?;
+        let plan: Value = serde_json::from_str(&text)?;
+        if !plan["sessions"]
+            .as_array()
+            .is_some_and(|v| v.iter().any(|s| s["id"] == id))
+        {
+            continue;
+        }
+        let attempts: i64 = store.db.query_row(
+            "SELECT count(*) FROM attempts WHERE id=?",
+            [&plan_id],
+            |r| r.get(0),
+        )?;
+        if plan_state != "prepared" || attempts != 0 {
+            return Ok(None);
+        }
+        plans.push(plan_id);
+    }
+    Ok(Some(plans))
+}
+
 pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
     let rt = gate(&store.root, false, now())?;
     if !store.root.join("config.json").exists() {
@@ -623,6 +725,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
     // cc.db is read-only and queried only by this idle, one-shot job.
     let cc_error = remember_cc(&store.root, &mut record, ccdb).err().is_some();
     let mut inserted = 0;
+    let mut migrated_pending = 0;
     let mut blocked = usize::from(awaiting_post_cutoff_open || awaiting_close);
     let mut closed_sittings = Vec::new();
     for window in &windows {
@@ -674,6 +777,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
         let hours:Vec<Value>=s.hours.iter().filter(|(_,n)|*n>0).map(|(h,n)|json!({"startOfHour":epoch(&format!("{day}T{h:02}:00:00")).unwrap(),"timeZone":"+08:00","readingTime":n,"ttsTime":0})).collect();
         let identity = json!({"extent":extent,"start_ms":start_ms,"end_ms":end_ms,"start_words":start_words,"end_words":end_words,"day":day,"hours":hours});
         let id = sha(identity.to_string());
+        let mut body = json!({"id":id,"local_book_id":book.cde_key,"title":book.title,"day":day,"started_at":s.started_at,"ended_at":s.ended_at,"seconds":s.seconds,"hours":hours,"counter_evidence":identity,"clock_verified":true,"sources":proofs,"bootstrap_cutoff_unix":effective_cutoff,"book_version":0,"book_version_source":"unavailable"});
         let held: Option<(String, String, i64, i64, i64)> = store
             .db
             .query_row(
@@ -694,11 +798,11 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
             continue;
         }
         let mut conflicts = store.db.prepare(
-            "SELECT end_ms,body FROM sessions WHERE extent=? AND day=? AND start_ms<? AND end_ms>?",
+            "SELECT id,state,end_ms,body FROM sessions WHERE extent=? AND day=? AND start_ms<? AND end_ms>?",
         )?;
-        let held: Vec<(i64, String)> = conflicts
+        let held: Vec<(String, String, i64, String)> = conflicts
             .query_map(params![extent, day, end_ms, start_ms], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?
             .collect::<std::result::Result<_, _>>()?;
         drop(conflicts);
@@ -707,8 +811,13 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
             .to_string();
         let witnessed_open:i64=store.db.query_row("SELECT count(*) FROM lines WHERE line LIKE ? AND line LIKE '%ReadingTimerController:%OpenBook%'",[format!("{stamp}%")],|r|r.get(0))?;
         let mut overlap = 0;
-        for (previous_end, text) in held {
+        let mut replacements = Vec::new();
+        for (previous_id, previous_state, previous_end, text) in held {
             let previous: Value = serde_json::from_str(&text)?;
+            if let Some(plans) = unsent_tail_plans(store, &previous, &previous_state, &body)? {
+                replacements.push((previous_id, previous, plans));
+                continue;
+            }
             // OpenBook TimeRead is integral seconds. A subsecond overlap may
             // be rounding only if disjoint native word counters and a later,
             // witnessed OpenBook independently prove a new reading session.
@@ -733,9 +842,27 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
         if overlap > 0 {
             blocked += 1
         }
-        let body = json!({"id":id,"local_book_id":book.cde_key,"title":book.title,"day":day,"started_at":s.started_at,"ended_at":s.ended_at,"seconds":s.seconds,"hours":hours,"counter_evidence":identity,"clock_verified":true,"sources":proofs,"bootstrap_cutoff_unix":effective_cutoff,"book_version":0,"book_version_source":"unavailable"});
         storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
-        store.db.execute(
+        let tx = store.db.unchecked_transaction()?;
+        if state == "pending" && !replacements.is_empty() {
+            body["supersedes_unsent_session_ids"] =
+                json!(replacements.iter().map(|r| r.0.clone()).collect::<Vec<_>>());
+            for (previous_id, previous, plans) in replacements {
+                for plan in plans {
+                    ensure!(tx.execute("UPDATE plans SET state='superseded_unsent' WHERE id=? AND state='prepared'", [&plan])? == 1,"pending tail plan ownership changed");
+                }
+                tx.execute("INSERT INTO meta VALUES (?,?)",params![format!("superseded_pending:{previous_id}"),json!({"previous":previous,"replacement_session_id":id,"reason":"native_close_timestamp_tail","never_dispatched":true}).to_string()])?;
+                ensure!(
+                    tx.execute(
+                        "DELETE FROM sessions WHERE id=? AND state='pending'",
+                        [previous_id]
+                    )? == 1,
+                    "pending tail session ownership changed"
+                );
+                migrated_pending += 1;
+            }
+        }
+        tx.execute(
             "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)",
             params![
                 id,
@@ -748,6 +875,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
                 body.to_string()
             ],
         )?;
+        tx.commit()?;
         inserted += 1;
     }
     storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
@@ -757,7 +885,7 @@ pub fn collect(store: &Store, documents: &Path, ccdb: &Path) -> Result<Value> {
         &json!({"complete":true,"blocked":blocked}),
     )?;
     Ok(
-        json!({"state":"collected","inserted_sessions":inserted,"blocked_sessions":blocked,"awaiting_post_cutoff_open":awaiting_post_cutoff_open,"awaiting_explicit_close":awaiting_close,"ccdb_unavailable":cc_error,"statistics":store.status()?}),
+        json!({"state":"collected","inserted_sessions":inserted,"migrated_unsent_tail_sessions":migrated_pending,"blocked_sessions":blocked,"awaiting_post_cutoff_open":awaiting_post_cutoff_open,"awaiting_explicit_close":awaiting_close,"ccdb_unavailable":cc_error,"statistics":store.status()?}),
     )
 }
 
@@ -879,9 +1007,11 @@ mod tests {
             "2026-09-06",
             &w
         ));
-        let unrelated = vec![anchors[0]
-            .replace("000200", "030200")
-            .replace("16:02:00Z", "19:02:00Z")];
+        let unrelated = vec![
+            anchors[0]
+                .replace("000200", "030200")
+                .replace("16:02:00Z", "19:02:00Z"),
+        ];
         assert!(!window_clock_verified(
             &unrelated,
             &witness,
@@ -1043,6 +1173,158 @@ mod pipeline_tests {
             collect(&s, &docs, &s.root.join("none")).unwrap()["inserted_sessions"],
             0
         );
+    }
+    fn close_tail_pending_fixture() -> (tempfile::TempDir, Store, PathBuf, Value) {
+        let (tmp, s, docs) = root();
+        let mut text = "260906:192400 cvm: I ReadingTimerController:Information::OpenBook,StoredBookData:TimeRead:329 sec. WPM:0. Version:0;\n260906:192403 cvm: I ReadingTimerController:Information::NextPage,Verdict:Processed,PageStartPos:HTMLPosition:7731097,IntervalTime:3236,IntervalWords:194,TotalTime:332236,TotalWords:2094,CurrentPos:HTMLPosition:7731097,EndPos:HTMLPosition:19886489;\n260906:192405 cvm: I ReaderBooklet:Information::ReaderBooklet stop\n260906:192406 cvm: I ReaderBooklet:Information::End of stop method\n260906:192406 cvm: I ReadingTimerController:Information::PageStartPos:HTMLPosition:7731725,IntervalTime:2867,IntervalWords:184,TotalTime:335103,TotalWords:2278,CurrentPos:HTMLPosition:7731725,EndPos:HTMLPosition:19886489;".to_owned();
+        for i in 0..3 {
+            text.push_str(&format!("\n260906:19240{i} cvm: I JSONJournalSaver modificationDate=2026-09-06T11:24:0{i}Z, annotationType=LastPositionReadAnnotation"));
+        }
+        fs::write(s.root.join("events/sealed/one.log"), text).unwrap();
+        let sidecar = docs.join("A.sdr/A.azw3f");
+        let mut raw = fs::read(&sidecar).unwrap();
+        for (old, new) in [(351002i64, 335103i64), (2077, 2278)] {
+            let at = raw.windows(8).position(|v| v == old.to_be_bytes()).unwrap();
+            raw[at..at + 8].copy_from_slice(&new.to_be_bytes());
+        }
+        fs::write(sidecar, raw).unwrap();
+        collect(&s, &docs, &s.root.join("none")).unwrap();
+        assert_eq!(s.status().unwrap()["pending_seconds"], 6);
+        let mut old: Value = serde_json::from_str(
+            &s.db
+                .query_row("SELECT body FROM sessions", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+        )
+        .unwrap();
+        old["seconds"] = json!(3);
+        old["ended_at"] = json!("2026-09-06T19:24:03");
+        old["hours"][0]["readingTime"] = json!(3);
+        old["counter_evidence"]["end_ms"] = json!(332236);
+        old["counter_evidence"]["end_words"] = json!(2094);
+        old["counter_evidence"]["hours"] = old["hours"].clone();
+        old["id"] = json!(sha(old["counter_evidence"].to_string()));
+        s.db.execute("DELETE FROM sessions", []).unwrap();
+        s.db.execute(
+            "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)",
+            params![
+                old["id"].as_str().unwrap(),
+                "A",
+                "2026-09-06",
+                old["counter_evidence"]["start_ms"].as_i64().unwrap(),
+                332236,
+                old["counter_evidence"]["extent"].as_i64().unwrap(),
+                "pending",
+                old.to_string()
+            ],
+        )
+        .unwrap();
+        s.db.execute(
+            "INSERT INTO plans VALUES ('old-tail-preview','prepared',?)",
+            [
+                json!({"plan_id":"old-tail-preview","local_book_id":"A","sessions":[old]})
+                    .to_string(),
+            ],
+        )
+        .unwrap();
+        (tmp, s, docs, old)
+    }
+    #[test]
+    fn same_second_native_close_tail_replaces_only_unsent_prefix_atomically() {
+        let (_tmp, s, docs, old) = close_tail_pending_fixture();
+        let got = collect(&s, &docs, &s.root.join("none")).unwrap();
+        assert_eq!(got["migrated_unsent_tail_sessions"], 1);
+        assert_eq!(got["blocked_sessions"], 0);
+        assert_eq!(s.status().unwrap()["pending_seconds"], 6);
+        let count: i64 =
+            s.db.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(count, 1);
+        let state: String =
+            s.db.query_row(
+                "SELECT state FROM plans WHERE id='old-tail-preview'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "superseded_unsent");
+        let archived: String =
+            s.db.query_row(
+                "SELECT value FROM meta WHERE key=?",
+                [format!(
+                    "superseded_pending:{}",
+                    old["id"].as_str().unwrap()
+                )],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&archived).unwrap()["previous"],
+            old
+        );
+        let next: Value = serde_json::from_str(
+            &s.db
+                .query_row("SELECT body FROM sessions", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(next["ended_at"], "2026-09-06T19:24:06");
+        assert_eq!(next["counter_evidence"]["end_ms"], 335103);
+        assert_eq!(
+            collect(&s, &docs, &s.root.join("none")).unwrap()["inserted_sessions"],
+            0
+        );
+    }
+    #[test]
+    fn native_close_tail_never_rewrites_an_attempted_or_confirmed_prefix() {
+        for state in ["pending", "unknown", "confirmed"] {
+            let (_tmp, s, docs, old) = close_tail_pending_fixture();
+            s.db.execute("UPDATE sessions SET state=?", [state])
+                .unwrap();
+            if state == "pending" {
+                s.db.execute(
+                    "INSERT INTO attempts VALUES ('old-tail-preview','unknown',?)",
+                    [json!({"plan":{"sessions":[old]}}).to_string()],
+                )
+                .unwrap();
+            }
+            let got = collect(&s, &docs, &s.root.join("none")).unwrap();
+            assert_eq!(got["migrated_unsent_tail_sessions"], 0);
+            assert_eq!(got["blocked_sessions"], 1);
+            let (held_state, text): (String, String) =
+                s.db.query_row(
+                    "SELECT state,body FROM sessions WHERE id=?",
+                    [old["id"].as_str().unwrap()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(held_state, state);
+            assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), old);
+            assert_eq!(
+                prepare(&s, Some("A"), true, 60).unwrap()["state"],
+                "empty_or_blocked"
+            );
+        }
+    }
+    #[test]
+    fn native_close_tail_requires_identical_window_and_immutable_sources() {
+        let (_tmp, s, docs, mut old) = close_tail_pending_fixture();
+        old["started_at"] = json!("2026-09-06T19:24:01");
+        s.db.execute("UPDATE sessions SET body=?", [old.to_string()])
+            .unwrap();
+        let got = collect(&s, &docs, &s.root.join("none")).unwrap();
+        assert_eq!(got["migrated_unsent_tail_sessions"], 0);
+        assert_eq!(got["blocked_sessions"], 1);
+        assert_eq!(
+            prepare(&s, Some("A"), true, 60).unwrap()["state"],
+            "empty_or_blocked"
+        );
+        let (_tmp, s, docs, mut old) = close_tail_pending_fixture();
+        old["sources"][0]["sha256"] = json!("changed-source");
+        s.db.execute("UPDATE sessions SET body=?", [old.to_string()])
+            .unwrap();
+        let got = collect(&s, &docs, &s.root.join("none")).unwrap();
+        assert_eq!(got["migrated_unsent_tail_sessions"], 0);
+        assert_eq!(got["blocked_sessions"], 1);
     }
     #[test]
     fn complete_cross_midnight_native_window_conserves_both_days() {

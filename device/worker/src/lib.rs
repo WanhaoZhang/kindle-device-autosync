@@ -5,11 +5,11 @@ pub mod manual;
 pub mod network;
 pub mod parsing;
 pub mod protocol;
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{Datelike, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -828,7 +828,7 @@ pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64)
         if c.mappings.iter().all(|m| m.local_book_id != local) {
             continue;
         }
-        let uncertain:i64=store.db.query_row("SELECT count(*) FROM sessions WHERE book=? AND state IN ('dispatching','unknown','needs_review','failed')",[local],|r|r.get(0))?;
+        let uncertain:i64=store.db.query_row("SELECT count(*) FROM sessions WHERE book=? AND state IN ('dispatching','unknown','needs_review','failed','blocked_overlap')",[local],|r|r.get(0))?;
         if uncertain > 0 {
             continue;
         }
@@ -903,6 +903,12 @@ fn verify_plan(store: &Store, c: &Config, plan: &Value, trial: bool) -> Result<(
         ),
         "mapping changed"
     );
+    let overlaps: i64 = store.db.query_row(
+        "SELECT count(*) FROM sessions WHERE book=? AND state='blocked_overlap'",
+        [plan["local_book_id"].as_str().context("missing book")?],
+        |r| r.get(0),
+    )?;
+    ensure!(overlaps == 0, "ambiguous native overlap blocks this book");
     if trial {
         experimental::verify_preview_trial_plan(&store.root, c, plan)?;
         ensure!(
