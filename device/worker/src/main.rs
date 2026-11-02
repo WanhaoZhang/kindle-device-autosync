@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ksync_worker::*;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -6,7 +6,7 @@ fn run() -> Result<serde_json::Value> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|s| s == "--help" || s == "-h") {
         println!(
-            "ksync-worker --root DIR self-test [--online-self-test]|collect|compact|sync|status|reconcile --plan-id ID|import-config --inbox DIR|export --out DIR\nDefault sync collects only. Manual trial: sync --trial --prepare --book-id KEY --max-seconds 60; then sync --trial --confirm --plan-id ID. Formal acceptance or explicit experimental trial authorization is required. Preview: operate --inbox DIR --action authorize-trial|prepare|confirm|enable-experimental|disable-experimental|authorize-prepare|confirm-enable."
+            "ksync-worker --root DIR self-test [--online-self-test]|collect|compact|sync|status|reconcile --plan-id ID|import-config --inbox DIR|export --out DIR\nDefault sync collects only. Manual trial: sync --trial --prepare --book-id KEY --max-seconds 60; then sync --trial --confirm --plan-id ID. Formal acceptance or explicit experimental trial authorization is required. Preview: operate --inbox DIR --action authorize-trial|prepare|confirm|enable-experimental|disable-experimental|authorize-prepare|confirm-enable|adopt-and-enable."
         );
         return Ok(json!({"state":"help"}));
     }

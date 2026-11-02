@@ -95,7 +95,8 @@ static inline int ksync_restrict_private_state(const char *root, uid_t owner) {
     "experimental-authorization.json", "validation-device.json",
     "collection-state.json", "sidecar-index.json", "catalog-index.json",
     "worker.lock", "collector.lock", "collector.checkpoint", "ledger.sqlite",
-    "ledger.sqlite-journal", "ledger.sqlite-wal", "ledger.sqlite-shm", "disabled"
+    "ledger.sqlite-journal", "ledger.sqlite-wal", "ledger.sqlite-shm", "disabled",
+    "readonly-recheck.pending"
   };
   int fd = ksync_private_root(root, owner);
   if (fd < 0)

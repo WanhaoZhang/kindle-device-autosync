@@ -777,17 +777,109 @@ pub fn matched(
     dafter: i64,
     seconds: i64,
 ) -> bool {
+    after.seconds - before.seconds == seconds
+        && dafter - dbefore == seconds
+        && position_unchanged(before, after)
+}
+fn position_unchanged(before: &Position, after: &Position) -> bool {
     let fields = [
         (before.progress, after.progress),
         (before.chapter, after.chapter),
         (before.offset, after.offset),
     ];
-    after.seconds - before.seconds == seconds
-        && dafter - dbefore == seconds
-        && fields.iter().all(|(b, a)| match b {
-            Some(v) => *a == Some(*v),
-            None => a.is_none() || *a == Some(0),
-        })
+    fields.iter().all(|(b, a)| match b {
+        Some(v) => *a == Some(*v),
+        None => a.is_none() || *a == Some(0),
+    })
+}
+
+// Only an unchanged or exactly-applied counter can still be a delayed cache.
+// Unexpected growth, a changed position or an invalid response stops polling.
+fn readback_may_be_delayed(
+    before: &Position,
+    after: &Position,
+    day_before: i64,
+    day_after: i64,
+    seconds: i64,
+) -> bool {
+    [0, seconds].contains(&(after.seconds - before.seconds))
+        && [0, seconds].contains(&(day_after - day_before))
+        && position_unchanged(before, after)
+}
+
+fn pause_for_readback(started: std::time::Instant) -> bool {
+    let budget = std::time::Duration::from_secs(30);
+    #[cfg(not(test))]
+    {
+        let pause = std::time::Instant::now();
+        while pause.elapsed() < std::time::Duration::from_secs(2) {
+            if cancelled() || started.elapsed() >= budget {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    !cancelled() && started.elapsed() < budget
+}
+
+/// A zero-byte scheduling hint, never an authorization to resend a POST.
+/// Only the live collector consumes it; no timer, wake lock or runtime state is
+/// created here. Refuse every unsafe existing object instead of replacing it.
+fn save_readonly_recheck_hint(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = unsafe { libc::geteuid() };
+    let directory = fs::symlink_metadata(root)?;
+    ensure!(
+        directory.is_dir()
+            && !directory.file_type().is_symlink()
+            && directory.uid() == owner
+            && directory.mode() & 0o077 == 0,
+        "unsafe private root for read-only recheck hint"
+    );
+    storage_budget(root, ROUTINE_TRANSACTION_BYTES)?;
+    let path = root.join("readonly-recheck.pending");
+    let valid = |md: &fs::Metadata| {
+        md.is_file()
+            && !md.file_type().is_symlink()
+            && md.uid() == owner
+            && md.mode() & 0o7777 == 0o600
+            && md.nlink() == 1
+            && md.len() == 0
+    };
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let before = fs::symlink_metadata(&path)?;
+            ensure!(valid(&before), "unsafe existing read-only recheck hint");
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(&path)?;
+            let opened = file.metadata()?;
+            ensure!(
+                valid(&opened) && opened.dev() == before.dev() && opened.ino() == before.ino(),
+                "read-only recheck hint changed during open"
+            );
+            file
+        }
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        valid(&file.metadata()?),
+        "unsafe created read-only recheck hint"
+    );
+    file.sync_all()?;
+    fs::File::open(root)?.sync_all()?;
+    Ok(())
 }
 
 pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64) -> Result<Value> {
@@ -1064,38 +1156,49 @@ pub fn commit_verified<T: network::Transport>(
     let mut state = if ack { "needs_review" } else { "unknown" };
     let mut after = None;
     let mut day_after = None;
-    // Once claimed, complete this one bounded request and two GET readbacks.
-    // Do not obey a foreground/sleep cancellation by killing an already-sent POST.
-    // No refresh, retry, or next batch exists beyond this boundary (<=3*20s HTTP budget).
-    let got = transport
-        .request(
-            "GET",
-            "/book/getProgress",
-            &[("bookId", bid.into())],
-            None,
-            &a,
-        )
-        .ok()
-        .and_then(|v| position(&v, bid).ok());
-    let daily = transport
-        .request("GET", "/readdata/detail", &query, None, &a)
-        .ok()
-        .and_then(|v| day_snapshot(&v, date).ok());
-    if let (Some(p), Some(d)) = (got, daily) {
-        let matches = matched(
-            &before,
-            &p,
-            day_before,
-            d,
-            plan["seconds"].as_i64().unwrap(),
-        );
-        after = Some(p);
-        day_after = Some(d);
-        if ack && matches {
+    let mut readback_rounds = 0;
+    let readback_started = std::time::Instant::now();
+    let seconds = plan["seconds"].as_i64().unwrap();
+    // Finish the first GET pair even after cancellation of an already-sent
+    // POST. An acknowledged, plausible delayed cache may get up to eight pairs,
+    // spaced two seconds apart. A new pair starts only within a 30s wall budget;
+    // the current pair still has the transport's two separate 20s timeouts.
+    // No POST replay or token renewal is permitted beyond the durable claim.
+    for round in 0..8 {
+        if round > 0 && !pause_for_readback(readback_started) {
+            break;
+        }
+        readback_rounds += 1;
+        let got = transport
+            .request(
+                "GET",
+                "/book/getProgress",
+                &[("bookId", bid.into())],
+                None,
+                &a,
+            )
+            .ok()
+            .and_then(|v| position(&v, bid).ok());
+        let daily = transport
+            .request("GET", "/readdata/detail", &query, None, &a)
+            .ok()
+            .and_then(|v| day_snapshot(&v, date).ok());
+        // Keep each successfully observed counter for diagnostics, including
+        // when the other response failed; only a complete pair can confirm.
+        after = got;
+        day_after = daily;
+        let (Some(p), Some(d)) = (&after, day_after) else {
+            break;
+        };
+        if ack && matched(&before, p, day_before, d, seconds) {
             state = "confirmed";
+            break;
+        }
+        if !ack || !readback_may_be_delayed(&before, p, day_before, d, seconds) || cancelled() {
+            break;
         }
     }
-    let receipt = json!({"plan_id":id,"state":state,"acknowledged":ack,"seconds":plan["seconds"],"before":before,"after":after,"day_before":day_before,"day_after":day_after,"replay_allowed":false});
+    let mut receipt = json!({"plan_id":id,"state":state,"acknowledged":ack,"seconds":plan["seconds"],"before":before,"after":after,"day_before":day_before,"day_after":day_after,"readback_rounds":readback_rounds,"replay_allowed":false});
     storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
     let tx = store.db.unchecked_transaction()?;
     tx.execute(
@@ -1110,6 +1213,16 @@ pub fn commit_verified<T: network::Transport>(
         )?;
     }
     tx.commit()?;
+    // A hint failure cannot turn a real receipt into a failed/confirmed upload.
+    // Publish it only after the acknowledged ownership is durably recorded.
+    receipt["readonly_recheck_hint_saved"] = json!(
+        ack && state == "needs_review"
+            && after
+                .as_ref()
+                .zip(day_after)
+                .is_some_and(|(p, d)| readback_may_be_delayed(&before, p, day_before, d, seconds))
+            && save_readonly_recheck_hint(&store.root).is_ok()
+    );
     Ok(receipt)
 }
 pub fn commit<T: network::Transport>(
@@ -1155,6 +1268,37 @@ fn drain_loop<T: network::Transport>(
             return Ok(
                 json!({"state":"paused","reason":"device_not_idle_awake_connected","confirmed_batches":batches,"confirmed_seconds":seconds}),
             );
+        }
+        // Acknowledged writes may become visible after the original worker
+        // exits. Recheck them using GET only before considering any new POST.
+        // Unknown/unacknowledged ownership stops everything without a request.
+        let unresolved = {
+            let mut stmt = store.db.prepare(
+                "SELECT id,state,body FROM attempts WHERE state IN ('dispatching','unknown','needs_review','failed') ORDER BY id",
+            )?;
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if unresolved.iter().any(|(_, state, body)| {
+            state != "needs_review"
+                || serde_json::from_str::<Value>(body).map_or(true, |v| v["acknowledged"] != true)
+        }) {
+            return Ok(
+                json!({"state":"needs_review","reason":"unresolved_write","confirmed_batches":batches,"confirmed_seconds":seconds}),
+            );
+        }
+        for (id, _, _) in unresolved {
+            if reconcile(store, &id, transport)?["state"] != "confirmed" {
+                return Ok(
+                    json!({"state":"needs_review","reason":"acknowledged_write_not_yet_verified","confirmed_batches":batches,"confirmed_seconds":seconds}),
+                );
+            }
         }
         let unresolved:i64=store.db.query_row("SELECT count(*) FROM attempts WHERE state IN ('dispatching','unknown','needs_review','failed')",[],|r|r.get(0))?;
         if unresolved > 0 {
@@ -1265,6 +1409,8 @@ mod tests {
         refreshes: usize,
         auth_fail_once: bool,
         calls: Vec<String>,
+        book_readbacks: usize,
+        day_readbacks: usize,
     }
     impl Transport for Mock {
         fn request(
@@ -1292,8 +1438,29 @@ mod tests {
                         self.auth_fail_once = false;
                         return Err(NetError::Auth);
                     }
+                    if self.posts > 0 {
+                        self.book_readbacks += 1;
+                        if self.mode == "post_read_auth" {
+                            return Err(NetError::Auth);
+                        }
+                        if self.mode == "cancel_during_readback" {
+                            request_cancel();
+                        }
+                    }
+                    let total =
+                        if self.mode == "delayed_book" && self.posts > 0 && self.book_readbacks < 3
+                        {
+                            0
+                        } else {
+                            self.total
+                        };
+                    let progress = if self.mode == "position_changed" && self.posts > 0 {
+                        11
+                    } else {
+                        10
+                    };
                     Ok(
-                        json!({"bookId":"example-book","timestamp":now(),"book":{"readingTime":100+self.total,"progress":10,"chapterUid":2,"chapterOffset":7}}),
+                        json!({"bookId":"example-book","timestamp":now(),"book":{"readingTime":100+total,"progress":progress,"chapterUid":2,"chapterOffset":7}}),
                     )
                 }
                 "/config" => {
@@ -1303,12 +1470,23 @@ mod tests {
                     Ok(json!({"token":"synthetic-config"}))
                 }
                 "/feature" => Ok(json!({})),
-                "/readdata/detail" => Ok(
-                    json!({"baseTime":if self.mode=="wrong_week"{0}else{1792944000i64},"readTimes":{"1793462400":self.day}}),
-                ),
+                "/readdata/detail" => {
+                    if self.posts > 0 {
+                        self.day_readbacks += 1;
+                    }
+                    let day =
+                        if self.mode == "delayed_day" && self.posts > 0 && self.day_readbacks < 3 {
+                            0
+                        } else {
+                            self.day
+                        };
+                    Ok(
+                        json!({"baseTime":if self.mode=="wrong_week"{0}else{1792944000i64},"readTimes":{"1793462400":day}}),
+                    )
+                }
                 "/book/batchUploadProgress" => {
                     self.posts += 1;
-                    if self.mode == "cancel_after" {
+                    if self.mode == "cancel_after" || self.mode == "cancel_stale" {
                         request_cancel();
                     }
                     if self.mode == "panic" {
@@ -1317,11 +1495,22 @@ mod tests {
                     if self.mode == "timeout" {
                         return Err(NetError::Uncertain);
                     }
-                    if self.mode != "ack_only" {
+                    if self.mode != "ack_only"
+                        && self.mode != "cancel_stale"
+                        && self.mode != "cancel_during_readback"
+                    {
                         let secs = body.unwrap()["books"][0]["readingTime"].as_i64().unwrap();
-                        self.total += secs;
+                        if self.mode != "day_only" {
+                            self.total += secs;
+                        }
+                        if self.mode == "unexpected_book_growth" {
+                            self.total += 1;
+                        }
                         if self.mode != "wrong_day" {
                             self.day += secs;
+                            if self.mode == "unexpected_day_growth" {
+                                self.day += 1;
+                            }
                         }
                     }
                     Ok(json!({"succ":1}))
@@ -1430,6 +1619,186 @@ mod tests {
             prepare(&s, Some("A"), true, 60).unwrap()["state"],
             "empty_or_blocked"
         );
+    }
+    #[test]
+    fn delayed_book_or_day_cache_confirms_without_another_post() {
+        for mode in ["delayed_book", "delayed_day"] {
+            let (_t, s, _) = fixture();
+            let id = plan(&s);
+            let mut m = Mock {
+                mode,
+                ..Default::default()
+            };
+            let receipt = commit_verified(&s, &id, true, &mut m).unwrap();
+            assert_eq!(receipt["state"], "confirmed", "{mode}");
+            assert_eq!(receipt["readback_rounds"], 3);
+            assert_eq!(receipt["after"]["seconds"], 113);
+            assert_eq!(receipt["day_after"], 13);
+            assert_eq!(
+                (m.posts, m.refreshes, m.book_readbacks, m.day_readbacks),
+                (1, 0, 3, 3)
+            );
+        }
+    }
+    #[test]
+    fn delayed_readbacks_are_bounded_and_unexpected_changes_stop_immediately() {
+        for (mode, rounds) in [
+            ("ack_only", 8),
+            ("position_changed", 1),
+            ("unexpected_book_growth", 1),
+            ("unexpected_day_growth", 1),
+            ("cancel_stale", 1),
+            ("cancel_during_readback", 1),
+            ("post_read_auth", 1),
+        ] {
+            let (_t, s, _) = fixture();
+            let id = plan(&s);
+            let mut m = Mock {
+                mode,
+                ..Default::default()
+            };
+            let receipt = commit_verified(&s, &id, true, &mut m).unwrap();
+            assert_eq!(receipt["state"], "needs_review", "{mode}");
+            assert_eq!(receipt["readback_rounds"], rounds, "{mode}");
+            assert_eq!(m.posts, 1);
+            assert_eq!(m.refreshes, 0);
+            assert_eq!(m.book_readbacks, rounds);
+            assert_eq!(m.day_readbacks, rounds);
+        }
+    }
+    #[test]
+    fn readback_budget_or_cancellation_prevents_waiting_for_another_pair() {
+        TEST_CANCEL.with(|v| v.set(false));
+        assert!(!pause_for_readback(
+            std::time::Instant::now() - std::time::Duration::from_secs(30)
+        ));
+        request_cancel();
+        assert!(!pause_for_readback(std::time::Instant::now()));
+        TEST_CANCEL.with(|v| v.set(false));
+    }
+    #[test]
+    fn readonly_recheck_hint_is_private_empty_single_link_and_idempotent() {
+        use std::os::unix::fs::MetadataExt;
+        let (_t, s, _) = fixture();
+        save_readonly_recheck_hint(&s.root).unwrap();
+        let path = s.root.join("readonly-recheck.pending");
+        let before = fs::symlink_metadata(&path).unwrap();
+        assert!(before.is_file());
+        assert_eq!(
+            (before.mode() & 0o7777, before.len(), before.nlink()),
+            (0o600, 0, 1)
+        );
+        assert_eq!(before.uid(), unsafe { libc::geteuid() });
+        save_readonly_recheck_hint(&s.root).unwrap();
+        assert_eq!(fs::symlink_metadata(path).unwrap().ino(), before.ino());
+    }
+    #[test]
+    fn readonly_recheck_hint_refuses_links_loose_modes_content_and_directories() {
+        use std::os::unix::fs::symlink;
+        for kind in [
+            "symlink",
+            "hardlink",
+            "loose",
+            "content",
+            "directory",
+            "fifo",
+        ] {
+            let (_t, s, _) = fixture();
+            let path = s.root.join("readonly-recheck.pending");
+            let target = s.root.join("untouched-marker-target");
+            fs::write(&target, []).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            match kind {
+                "symlink" => symlink(&target, &path).unwrap(),
+                "hardlink" => fs::hard_link(&target, &path).unwrap(),
+                "directory" => fs::create_dir(&path).unwrap(),
+                "fifo" => {
+                    use std::os::unix::ffi::OsStrExt;
+                    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                "loose" => {
+                    fs::write(&path, []).unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                "content" => {
+                    fs::write(&path, b"not-empty").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(save_readonly_recheck_hint(&s.root).is_err(), "{kind}");
+            assert_eq!(fs::read(&target).unwrap(), b"");
+        }
+    }
+    #[test]
+    fn recheck_hint_only_tracks_plausible_acknowledged_results_and_failures_do_not_replace_receipts()
+     {
+        for mode in [
+            "ack_only",
+            "timeout",
+            "position_changed",
+            "unexpected_book_growth",
+            "unexpected_day_growth",
+            "post_read_auth",
+        ] {
+            let (_t, s, _) = fixture();
+            let id = plan(&s);
+            let mut transport = Mock {
+                mode,
+                ..Default::default()
+            };
+            let receipt = commit_verified(&s, &id, true, &mut transport).unwrap();
+            let expected = mode == "ack_only";
+            assert_eq!(receipt["readonly_recheck_hint_saved"], expected, "{mode}");
+            assert_eq!(
+                s.root.join("readonly-recheck.pending").exists(),
+                expected,
+                "{mode}"
+            );
+        }
+        let (_t, s, _) = fixture();
+        let id = plan(&s);
+        fs::create_dir(s.root.join("readonly-recheck.pending")).unwrap();
+        let mut transport = Mock {
+            mode: "ack_only",
+            ..Default::default()
+        };
+        let receipt = commit_verified(&s, &id, true, &mut transport).unwrap();
+        assert_eq!(receipt["state"], "needs_review");
+        assert_eq!(receipt["readonly_recheck_hint_saved"], false);
+        assert_eq!(transport.posts, 1);
+        assert_eq!(
+            s.db.query_row("SELECT state FROM attempts WHERE id=?", [&id], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "needs_review"
+        );
+    }
+    #[test]
+    fn readonly_reconcile_renews_hint_only_while_counters_are_plausibly_delayed() {
+        let (_t, s, _) = fixture();
+        let id = plan(&s);
+        let mut transport = Mock {
+            mode: "day_only",
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_verified(&s, &id, true, &mut transport).unwrap()["readonly_recheck_hint_saved"],
+            true
+        );
+        let marker = s.root.join("readonly-recheck.pending");
+        fs::remove_file(&marker).unwrap();
+        let pending = reconcile(&s, &id, &mut transport).unwrap();
+        assert_eq!(pending["state"], "needs_review");
+        assert_eq!(pending["readonly_recheck_hint_saved"], true);
+        fs::remove_file(&marker).unwrap();
+        transport.total = 13;
+        let confirmed = reconcile(&s, &id, &mut transport).unwrap();
+        assert_eq!(confirmed["state"], "confirmed");
+        assert_eq!(confirmed["readonly_recheck_hint_saved"], false);
+        assert!(!marker.exists());
+        assert_eq!(transport.posts, 1);
     }
     #[test]
     fn timeout_never_retried() {
@@ -1694,7 +2063,7 @@ mod tests {
         let (_t, s, _) = fixture();
         let id = plan(&s);
         let mut m = Mock {
-            mode: "ack_only",
+            mode: "day_only",
             ..Default::default()
         };
         assert_eq!(
@@ -1704,9 +2073,47 @@ mod tests {
         m.total = 13;
         m.day = 13;
         let posts = m.posts;
-        assert_eq!(reconcile(&s, &id, &mut m).unwrap()["state"], "confirmed");
-        assert_eq!(reconcile(&s, &id, &mut m).unwrap()["state"], "confirmed");
+        let receipt = reconcile(&s, &id, &mut m).unwrap();
+        assert_eq!(receipt["state"], "confirmed");
+        assert_eq!(receipt["original_after"]["seconds"], 100);
+        assert_eq!(receipt["original_day_after"], 13);
+        assert_eq!(receipt["after"]["seconds"], 113);
+        assert_eq!(receipt["day_after"], 13);
+        assert_eq!(receipt["after"], receipt["recheck_after"]);
+        assert_eq!(receipt["day_after"], receipt["recheck_day_after"]);
+        assert_eq!(reconcile(&s, &id, &mut m).unwrap(), receipt);
         assert_eq!(m.posts, posts);
+    }
+    #[test]
+    fn reconcile_preserves_existing_original_observations() {
+        let (_t, s, _) = fixture();
+        let id = plan(&s);
+        let mut m = Mock {
+            mode: "ack_only",
+            ..Default::default()
+        };
+        let mut receipt = commit_verified(&s, &id, true, &mut m).unwrap();
+        receipt["original_after"] = json!({"audit":"existing-original"});
+        receipt["original_day_after"] = json!(null);
+        s.db.execute(
+            "UPDATE attempts SET body=? WHERE id=?",
+            params![receipt.to_string(), &id],
+        )
+        .unwrap();
+        m.total = 13;
+        m.day = 13;
+        let actual = reconcile(&s, &id, &mut m).unwrap();
+        assert_eq!(actual["original_after"], receipt["original_after"]);
+        assert_eq!(actual["original_day_after"], json!(null));
+        assert_eq!(actual["after"]["seconds"], 113);
+        let saved: String =
+            s.db.query_row(
+                "SELECT body FROM attempts WHERE id=? AND state='confirmed'",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), actual);
     }
     #[test]
     fn reconcile_never_replays_unknown_or_refreshes() {
@@ -1921,6 +2328,65 @@ mod tests {
         assert_eq!(transport.posts, 1);
         drain_loop(&s, &mut transport, false).unwrap();
         assert_eq!(transport.posts, 1);
+    }
+    #[test]
+    fn automatic_drain_reconciles_acknowledged_cache_delay_before_new_writes() {
+        let (_t, s, mut c) = fixture();
+        c.validation.protocol_validation = true;
+        c.validation.binding_sha256 = c.binding().unwrap();
+        atomic_json(
+            &s.root.join("config.json"),
+            &serde_json::to_value(c).unwrap(),
+        )
+        .unwrap();
+        let id = plan(&s);
+        let mut transport = Mock {
+            mode: "ack_only",
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_verified(&s, &id, true, &mut transport).unwrap()["state"],
+            "needs_review"
+        );
+        transport.total = 13;
+        transport.day = 13;
+        let result = drain_loop(&s, &mut transport, false).unwrap();
+        assert_eq!(result["state"], "drained_or_blocked");
+        assert_eq!(result["confirmed_batches"], 0);
+        assert_eq!(transport.posts, 1);
+        let saved: String =
+            s.db.query_row("SELECT state FROM attempts WHERE id=?", [&id], |r| r.get(0))
+                .unwrap();
+        assert_eq!(saved, "confirmed");
+        assert_eq!(s.status().unwrap()["confirmed_seconds"], 13);
+    }
+    #[test]
+    fn automatic_drain_does_not_contact_network_for_unknown_write() {
+        let (_t, s, mut c) = fixture();
+        c.validation.protocol_validation = true;
+        c.validation.binding_sha256 = c.binding().unwrap();
+        atomic_json(
+            &s.root.join("config.json"),
+            &serde_json::to_value(c).unwrap(),
+        )
+        .unwrap();
+        let id = plan(&s);
+        let mut transport = Mock {
+            mode: "timeout",
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_verified(&s, &id, true, &mut transport).unwrap()["state"],
+            "unknown"
+        );
+        let before = transport.calls.len();
+        assert_eq!(
+            drain_loop(&s, &mut transport, false).unwrap()["state"],
+            "needs_review"
+        );
+        assert_eq!(transport.calls.len(), before);
+        assert_eq!(transport.posts, 1);
+        assert_eq!(transport.refreshes, 0);
     }
     #[test]
     fn model_prefix_reads_exactly_four_bytes_without_reading_serial_tail() {
@@ -2155,6 +2621,7 @@ pub fn reconcile<T: network::Transport>(
     let seconds = plan["seconds"].as_i64().context("missing seconds")?;
     receipt["recheck_after"] = serde_json::to_value(&after)?;
     receipt["recheck_day_after"] = json!(day_after);
+    receipt["readonly_recheck_hint_saved"] = json!(false);
     if matched(&before, &after, day_before, day_after, seconds) {
         storage_budget(&store.root, ROUTINE_TRANSACTION_BYTES)?;
         let tx = store.db.unchecked_transaction()?;
@@ -2165,6 +2632,17 @@ pub fn reconcile<T: network::Transport>(
             )? == 1,
             "reconcile ownership changed"
         );
+        // Preserve the original possibly-stale observations as evidence, while
+        // making the canonical confirmed receipt describe the actual GETs that
+        // established both counters and the unchanged reading position.
+        if receipt.get("original_after").is_none() {
+            receipt["original_after"] = receipt["after"].clone();
+        }
+        if receipt.get("original_day_after").is_none() {
+            receipt["original_day_after"] = receipt["day_after"].clone();
+        }
+        receipt["after"] = serde_json::to_value(&after)?;
+        receipt["day_after"] = json!(day_after);
         receipt["state"] = json!("confirmed");
         receipt["verification"] = json!("matched_on_readonly_recheck");
         tx.execute(
@@ -2179,6 +2657,11 @@ pub fn reconcile<T: network::Transport>(
             )?;
         }
         tx.commit()?;
+    } else {
+        receipt["readonly_recheck_hint_saved"] = json!(
+            readback_may_be_delayed(&before, &after, day_before, day_after, seconds)
+                && save_readonly_recheck_hint(&store.root).is_ok()
+        );
     }
     Ok(receipt)
 }

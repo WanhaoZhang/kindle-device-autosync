@@ -140,6 +140,14 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(config.read_text(),'synthetic fixture')
         self.assertEqual(config.stat().st_mode & 0o7777,0o600)
 
+    def test_readonly_hint_is_one_shot_and_only_runs_awake_idle_online(self):
+        source=Path(__file__).resolve().parent/'test_readonly_recheck.c'
+        unit=self.path/'readonly-recheck-tests'
+        subprocess.run([os.environ.get('CC','cc'),'-O2','-std=c11','-Wall','-Wextra','-Werror',str(source),'-o',str(unit)],check=True)
+        home=self.path/'readonly-unit';home.mkdir(mode=0o700)
+        result=subprocess.run([str(unit),str(home)],capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+
     def test_startup_and_respawn_request_adapter_state_replay(self):
         path=self.root/'adapter-control.fifo';os.mkfifo(path,0o600)
         fd=os.open(path,os.O_RDWR|os.O_NONBLOCK);self.addCleanup(os.close,fd)

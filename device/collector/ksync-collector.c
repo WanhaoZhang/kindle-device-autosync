@@ -61,6 +61,7 @@ static unsigned long long queue_max = 4 * 1024 * 1024,
                           reserve_min = 24 * 1024 * 1024 + 64 * 1024,
                           queue_cached, free_cached;
 static long long room_checked, gzip_due_ms;
+static long long readonly_recheck_due_ms;
 static char reader[16] = "unknown", power[16] = "unknown";
 static int usb = 0, net = 0, ever_opened = 0, booklet_stopping = 0;
 static pid_t worker = 0;
@@ -871,7 +872,14 @@ static void cancel_worker(void) {
   if (worker > 0)
     kill(worker, SIGTERM);
 }
+static int consume_readonly_recheck(void);
 static void control_line(char *l) {
+  if (!strcmp(l, "maintenance check-readonly-hint")) {
+    /* Manual KUAL workers are not our children. Inspect their hint without
+     * changing any native reader/power/network, gap or blocked observation. */
+    consume_readonly_recheck();
+    return;
+  }
   char a[32], b[32];
   if (sscanf(l, "%31s %31s", a, b) != 2)
     return;
@@ -931,6 +939,42 @@ static void controls(void) {
         len = 0;
     }
 }
+/* A zero-byte hint requests one delayed ordinary sync. It never wakes the
+ * device: CLOCK_MONOTONIC and poll both stop with system suspend. */
+static int consume_readonly_recheck(void) {
+  int dirfd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dirfd < 0)
+    return 0;
+  struct stat parent, held, current;
+  int valid = !fstat(dirfd, &parent) && parent.st_uid == geteuid() &&
+              !(parent.st_mode & 0077);
+  int fd = valid ? openat(dirfd, "readonly-recheck.pending",
+      O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC) : -1;
+  valid = fd >= 0 && !fstat(fd, &held) && S_ISREG(held.st_mode) &&
+          held.st_uid == geteuid() && held.st_nlink == 1 && held.st_size == 0 &&
+          (held.st_mode & 07777) == 0600 &&
+          !fstatat(dirfd, "readonly-recheck.pending", &current, AT_SYMLINK_NOFOLLOW) &&
+          S_ISREG(current.st_mode) && current.st_dev == held.st_dev &&
+          current.st_ino == held.st_ino;
+  if (valid)
+    valid = !unlinkat(dirfd, "readonly-recheck.pending", 0);
+  if (fd >= 0)
+    close(fd);
+  close(dirfd);
+  if (valid)
+    readonly_recheck_due_ms = monotonic_ms() + 60000;
+  return valid;
+}
+/* No extra timeout while reading, asleep, offline, exporting USB, blocked, or
+ * before the original twenty-second witnessed idle window. */
+static int readonly_recheck_timeout(long long at) {
+  if (!readonly_recheck_due_ms || worker > 0 || blocked || usb || !net ||
+      strcmp(reader, "idle") || strcmp(power, "awake") ||
+      at < idle_mono_ms + 20000)
+    return -1;
+  return at >= readonly_recheck_due_ms ? 0 :
+         (int)(readonly_recheck_due_ms - at);
+}
 static void maybe_worker(void) {
   if (worker > 0) {
     int status;
@@ -938,12 +982,17 @@ static void maybe_worker(void) {
     if (r == worker) {
       worker = 0;
       room_checked = 0;
+      consume_readonly_recheck();
     } else
       return;
   }
   if (blocked || usb || strcmp(reader, "idle") || strcmp(power, "awake") ||
       monotonic_ms() < idle_mono_ms + 20000)
     return;
+  if (readonly_recheck_timeout(monotonic_ms()) == 0) {
+    readonly_recheck_due_ms = 0;
+    last_worker_mode[0] = 0;
+  }
   const char *mode = net ? "sync" : "collect";
   if (!strcmp(last_worker_mode, mode))
     return;
@@ -1058,6 +1107,7 @@ int main(int argc, char **argv) {
   *slash = 0;
   bootstrap = nowsec();
   last_sync = monotonic_ms();
+  consume_readonly_recheck();
   load_checkpoint();
   idle_mono_ms = monotonic_ms();
   if (!nc) {
@@ -1133,6 +1183,9 @@ int main(int argc, char **argv) {
       if (timeout < 0 || due < timeout)
         timeout = due;
     }
+    int readonly_due = readonly_recheck_timeout(n);
+    if (readonly_due >= 0 && (timeout < 0 || readonly_due < timeout))
+      timeout = readonly_due;
     if (worker > 0 && (timeout < 0 || timeout > 1000))
       timeout = 1000;
     if (poll_ms && (timeout < 0 || timeout > poll_ms))

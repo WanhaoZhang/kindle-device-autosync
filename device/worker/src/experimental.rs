@@ -1,11 +1,19 @@
 //! Explicit preview authorization. Does not manufacture formal acceptance.
 use crate::*;
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::Read, path::Path, sync::OnceLock};
 
 const TLS_PROOF: &str = "validation-tls.json";
 const AUTHORIZATION: &str = "experimental-authorization.json";
+// An explicit compatibility bridge for the shipped build which performed the
+// first real trial. This is not a general binary-identity bypass.
+const LEGACY_TRIAL_WORKER: &str =
+    "2430ce27e9150ebd06fa99f34d97f1472261d71ed1e3ea2c7512efab35075420";
+const LEGACY_PROTOCOL_SOURCE: &str =
+    "233bc9ccdd944ef9bc9f0e96ec37f8af028711f7cf4587b00de618b61810dc1e";
+const LEGACY_NETWORK_SOURCE: &str =
+    "1cc550bab418ae47d30b0c987cc9e4281538d17a65bb5a14de3bfaa9404cda73";
 static EXECUTABLE_SHA: OnceLock<String> = OnceLock::new();
 fn executable_sha() -> Result<String> {
     if let Some(v) = EXECUTABLE_SHA.get() {
@@ -178,6 +186,73 @@ pub fn verify_preview_trial_plan(root: &Path, c: &Config, plan: &Value) -> Resul
     Ok(())
 }
 
+fn unchanged_legacy_wire() -> Result<()> {
+    ensure!(
+        sha(include_bytes!("protocol.rs")) == LEGACY_PROTOCOL_SOURCE
+            && sha(include_bytes!("network.rs")) == LEGACY_NETWORK_SOURCE,
+        "legacy trial adoption requires byte-identical protocol and transport sources"
+    );
+    Ok(())
+}
+fn legacy_authorization(c: &Config, probe: &Value, previous: &Value) -> Result<()> {
+    actual_supported(probe)?;
+    unchanged_legacy_wire()?;
+    ensure!(
+        previous["schema_version"] == 1
+            && previous["config_binding_sha256"] == c.binding()?
+            && previous["kernel_release"] == probe["kernel_release"]
+            && previous["worker_sha256"] == LEGACY_TRIAL_WORKER
+            && previous["accept_unverified_performance"] == true
+            && previous["formal_device_validation_claimed"] == false
+            && previous["formal_protocol_validation_claimed"] == false
+            && (previous["mode"] == "trial" || previous["mode"] == "auto")
+            && previous["created_unix"]
+                .as_i64()
+                .is_some_and(|t| t > 0 && t <= now() + 5),
+        "legacy authorization does not match the actual installation"
+    );
+    Ok(())
+}
+fn trial_authorization_matches(
+    c: &Config,
+    plan: &Value,
+    receipt: &Value,
+    auth: &Value,
+) -> Result<()> {
+    if plan["preview_worker_sha256"] == auth["worker_sha256"]
+        && plan["preview_authorization_created_unix"] == auth["created_unix"]
+    {
+        return Ok(());
+    }
+    unchanged_legacy_wire()?;
+    let proof = &auth["trial_adoption"];
+    let previous = &proof["prior_authorization"];
+    ensure!(
+        proof["schema_version"] == 1
+            && proof["kind"] == "verified_legacy_trial_adoption"
+            && proof["plan_id"] == plan["plan_id"]
+            && proof["original_post_worker_sha256"] == LEGACY_TRIAL_WORKER
+            && proof["current_worker_executed_original_post"] == false
+            && proof["current_worker_sha256"] == auth["worker_sha256"]
+            && proof["current_worker_sha256"] == executable_sha()?
+            && proof["config_binding_sha256"] == c.binding()?
+            && proof["kernel_release"] == auth["kernel_release"]
+            && proof["protocol_source_sha256"] == LEGACY_PROTOCOL_SOURCE
+            && proof["network_source_sha256"] == LEGACY_NETWORK_SOURCE
+            && proof["verified_receipt_sha256"] == sha(receipt.to_string())
+            && previous["config_binding_sha256"] == c.binding()?
+            && previous["kernel_release"] == auth["kernel_release"]
+            && previous["worker_sha256"] == LEGACY_TRIAL_WORKER
+            && previous["accept_unverified_performance"] == true
+            && previous["formal_device_validation_claimed"] == false
+            && previous["formal_protocol_validation_claimed"] == false
+            && plan["preview_worker_sha256"] == LEGACY_TRIAL_WORKER
+            && plan["preview_authorization_created_unix"] == previous["created_unix"],
+        "trial was not executed by this worker or its explicitly verified predecessor"
+    );
+    Ok(())
+}
+
 fn verified_trial(store: &Store, c: &Config, id: &str, authorization: &Value) -> Result<Value> {
     let (plan_state, text): (String, String) =
         store
@@ -206,6 +281,7 @@ fn verified_trial(store: &Store, c: &Config, id: &str, authorization: &Value) ->
         plan_state == "confirmed"
             && attempt_state == "confirmed"
             && receipt["state"] == "confirmed"
+            && receipt["plan_id"] == id
             && receipt["acknowledged"] == true,
         "trial has not been confirmed by exact readback"
     );
@@ -219,11 +295,7 @@ fn verified_trial(store: &Store, c: &Config, id: &str, authorization: &Value) ->
             && plan["sessions"].as_array().is_some_and(|v| v.len() == 1),
         "confirmed trial belongs to another config/account or is not a whole short trial"
     );
-    ensure!(
-        plan["preview_worker_sha256"] == authorization["worker_sha256"]
-            && plan["preview_authorization_created_unix"] == authorization["created_unix"],
-        "trial was not executed under the current worker authorization"
-    );
+    trial_authorization_matches(c, &plan, &receipt, authorization)?;
     let before: Position = serde_json::from_value(receipt["before"].clone())?;
     let after: Position = serde_json::from_value(receipt["after"].clone())?;
     ensure!(
@@ -246,6 +318,129 @@ fn verified_trial(store: &Store, c: &Config, id: &str, authorization: &Value) ->
         "unresolved writes prevent enabling automatic sync"
     );
     Ok(plan)
+}
+
+fn adopt_authorization(
+    store: &Store,
+    c: &Config,
+    id: &str,
+    previous: &Value,
+    probe: &Value,
+) -> Result<Value> {
+    legacy_authorization(c, probe, previous)?;
+    let plan = verified_trial(store, c, id, previous)?;
+    for session in plan["sessions"].as_array().unwrap() {
+        parsing::verify_manifest(&store.root, session)?;
+    }
+    let text: String = store
+        .db
+        .query_row("SELECT body FROM attempts WHERE id=?", [id], |r| r.get(0))?;
+    let receipt: Value = serde_json::from_str(&text)?;
+    let mut current = check_tls(&store.root, c, probe)?;
+    current["mode"] = json!("trial");
+    current["created_unix"] = json!(now());
+    current["accept_unverified_performance"] = json!(true);
+    current["accept_unverified_protocol"] = json!(false);
+    current["formal_device_validation_claimed"] = json!(false);
+    current["formal_protocol_validation_claimed"] = json!(false);
+    current["trial_adoption"] = json!({"schema_version":1,"kind":"verified_legacy_trial_adoption","plan_id":id,"original_post_worker_sha256":LEGACY_TRIAL_WORKER,"current_worker_executed_original_post":false,"current_worker_sha256":current["worker_sha256"],"config_binding_sha256":c.binding()?,"kernel_release":current["kernel_release"],"protocol_source_sha256":LEGACY_PROTOCOL_SOURCE,"network_source_sha256":LEGACY_NETWORK_SOURCE,"verified_receipt_sha256":sha(receipt.to_string()),"readonly_verified_unix":now(),"prior_authorization":previous});
+    // One private atomic file keeps the original execution evidence and the new
+    // authorization together, and remains covered by permission restoration.
+    atomic_json(&store.root.join(AUTHORIZATION), &current)?;
+    Ok(current)
+}
+
+/// Renew authentication only before read-only rechecking. Never resends the
+/// predecessor's trial, rewrites its plan, or claims its POST for the new ELF.
+pub fn adopt_and_enable(
+    store: &Store,
+    c: &Config,
+    id: &str,
+    performance: bool,
+    protocol: bool,
+) -> Result<Value> {
+    ensure!(
+        performance && protocol,
+        "explicit adoption and experimental acceptance required"
+    );
+    let probe = actual_device();
+    let held = private_json(&store.root.join(AUTHORIZATION))?;
+    let previous = if held["worker_sha256"] == LEGACY_TRIAL_WORKER {
+        held
+    } else {
+        held["trial_adoption"]["prior_authorization"].clone()
+    };
+    legacy_authorization(c, &probe, &previous)?;
+    check_tls(&store.root, c, &probe)?;
+    let text: String = store
+        .db
+        .query_row("SELECT body FROM plans WHERE id=?", [id], |r| r.get(0))?;
+    let plan: Value = serde_json::from_str(&text)?;
+    let mut hash_body = plan.clone();
+    hash_body
+        .as_object_mut()
+        .context("invalid legacy trial plan")?
+        .remove("plan_id");
+    ensure!(
+        plan["plan_id"] == id
+            && sha(hash_body.to_string()) == id
+            && plan["trial"] == true
+            && plan["seconds"]
+                .as_i64()
+                .is_some_and(|s| (1..=60).contains(&s))
+            && plan["sessions"].as_array().is_some_and(|s| s.len() == 1)
+            && plan["preview_worker_sha256"] == LEGACY_TRIAL_WORKER
+            && plan["preview_authorization_created_unix"] == previous["created_unix"]
+            && plan["binding_sha256"] == c.binding()?
+            && plan["account_hash"] == c.account_hash(),
+        "legacy trial origin mismatch"
+    );
+    manual::gate_manual(&store.root, true)?;
+    let mut transport = network::Live::default();
+    let mut auth = Auth::load(&store.root, c)?;
+    let mut refreshed = false;
+    let baseline = network::preflight(
+        &mut transport,
+        &store.root,
+        &mut auth,
+        &mut refreshed,
+        "/book/getProgress",
+        &[(
+            "bookId",
+            plan["weread_book_id"]
+                .as_str()
+                .context("missing legacy book")?
+                .into(),
+        )],
+    )?;
+    ensure!(
+        baseline["timestamp"]
+            .as_i64()
+            .is_some_and(|t| (t - now()).abs() <= 600),
+        "device/server clock mismatch; adoption blocked"
+    );
+    let receipt = manual::reconcile_manual(store, id, &mut transport)?;
+    ensure!(
+        receipt["state"] == "confirmed",
+        "legacy trial still awaiting exact live book/day/position readback"
+    );
+    manual::gate_manual(&store.root, true)?;
+    ensure!(
+        Config::load(&store.root)?.binding()? == c.binding()?,
+        "configuration changed during adoption"
+    );
+    let collected = parsing::collect(
+        store,
+        Path::new("/mnt/us/documents"),
+        Path::new("/var/local/metadata/cc.db"),
+    )?;
+    manual::gate_manual(&store.root, true)?;
+    let adopted = adopt_authorization(store, c, id, &previous, &probe)?;
+    let activation = enable(store, c, id, true)?;
+    let drained=drain(store,&mut transport).unwrap_or_else(|_|json!({"state":"paused","reason":"automatic_drain_stopped","retry_on_future_safe_event":true}));
+    Ok(
+        json!({"state":"legacy_trial_adopted","original_trial_post_replayed":false,"trial_plan_unchanged":true,"adoption":adopted["trial_adoption"],"reconciled_receipt":receipt,"experimental_activation":activation,"collected":collected,"automatic_drain":drained}),
+    )
 }
 pub fn enable(store: &Store, c: &Config, id: &str, accept: bool) -> Result<Value> {
     enable_with_probe(store, c, id, accept, &actual_device())
@@ -327,6 +522,16 @@ pub fn operate(store: &Store, inbox: &Path, action: &str) -> Result<Value> {
         "action/request configuration mismatch"
     );
     match action {
+        "adopt-and-enable" => adopt_and_enable(
+            store,
+            &c,
+            request
+                .plan_id
+                .as_deref()
+                .context("missing exact legacy trial plan")?,
+            request.accept_unverified_performance,
+            request.accept_unverified_protocol,
+        ),
         "authorize-prepare" => {
             authorize_trial(&store.root, &c, request.accept_unverified_performance)?;
             manual::gate_manual(&store.root, false)?;
@@ -439,7 +644,10 @@ mod tests {
         record_live_tls(root,c,p,&json!({"state":"completed","https_certificate_validated":true,"credentials_sent":false,"network_writes":false})).unwrap();
     }
     fn confirmed_trial(s: &Store, c: &Config) -> String {
-        let mut p = json!({"trial":true,"binding_sha256":c.binding().unwrap(),"account_hash":c.account_hash(),"seconds":13,"sessions":[{"id":"synthetic-session"}]});
+        fs::create_dir_all(s.root.join("events/sealed")).unwrap();
+        let source = s.root.join("events/sealed/synthetic.log");
+        fs::write(&source, "synthetic immutable native trial evidence\n").unwrap();
+        let mut p = json!({"trial":true,"binding_sha256":c.binding().unwrap(),"account_hash":c.account_hash(),"seconds":13,"sessions":[{"id":"synthetic-session","sources":[{"path":source,"sha256":sha(fs::read(&source).unwrap())}]}]});
         let authorization = private_json(&s.root.join(AUTHORIZATION)).unwrap();
         p["preview_worker_sha256"] = authorization["worker_sha256"].clone();
         p["preview_authorization_created_unix"] = authorization["created_unix"].clone();
@@ -538,6 +746,135 @@ mod tests {
         s.db.execute("UPDATE attempts SET body=?", [receipt.to_string()])
             .unwrap();
         assert!(enable_with_probe(&s, &c, &id, true, &p).is_err());
+    }
+    fn legacy_trial_fixture() -> (TempDir, Store, Config, Value, Value, String) {
+        let (t, s, c, p) = fixture();
+        tls(t.path(), &c, &p);
+        authorize_trial_with_probe(t.path(), &c, true, &p).unwrap();
+        let mut prior = private_json(&t.path().join(AUTHORIZATION)).unwrap();
+        prior["worker_sha256"] = json!(LEGACY_TRIAL_WORKER);
+        atomic_json(&t.path().join(AUTHORIZATION), &prior).unwrap();
+        let id = confirmed_trial(&s, &c);
+        (t, s, c, p, prior, id)
+    }
+    #[test]
+    fn legacy_adoption_preserves_original_execution_and_requires_verified_receipt() {
+        let (t, s, c, p, prior, id) = legacy_trial_fixture();
+        let original_plan: String =
+            s.db.query_row("SELECT body FROM plans WHERE id=?", [&id], |r| r.get(0))
+                .unwrap();
+        let original_receipt: String =
+            s.db.query_row("SELECT body FROM attempts WHERE id=?", [&id], |r| r.get(0))
+                .unwrap();
+        let adopted = adopt_authorization(&s, &c, &id, &prior, &p).unwrap();
+        assert_eq!(
+            adopted["trial_adoption"]["original_post_worker_sha256"],
+            LEGACY_TRIAL_WORKER
+        );
+        assert_eq!(
+            adopted["trial_adoption"]["current_worker_executed_original_post"],
+            false
+        );
+        assert_eq!(adopted["trial_adoption"]["prior_authorization"], prior);
+        assert_ne!(adopted["worker_sha256"], LEGACY_TRIAL_WORKER);
+        assert_eq!(
+            s.db.query_row("SELECT body FROM plans WHERE id=?", [&id], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            original_plan
+        );
+        assert_eq!(
+            s.db.query_row("SELECT body FROM attempts WHERE id=?", [&id], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            original_receipt
+        );
+        enable_with_probe(&s, &c, &id, true, &p).unwrap();
+        assert!(checked_authorization(t.path(), &c, &p, true).is_ok());
+        assert!(!Config::load(t.path()).unwrap().validation.device_validation);
+        assert!(
+            !Config::load(t.path())
+                .unwrap()
+                .validation
+                .protocol_validation
+        );
+    }
+    #[test]
+    fn legacy_adoption_never_promotes_partial_unknown_or_foreign_execution() {
+        for cause in ["partial_book", "unknown", "other_worker", "other_account"] {
+            let (t, s, c, p, mut prior, id) = legacy_trial_fixture();
+            match cause {
+                "partial_book" => {
+                    let mut r: Value = serde_json::from_str(
+                        &s.db
+                            .query_row("SELECT body FROM attempts WHERE id=?", [&id], |r| {
+                                r.get::<_, String>(0)
+                            })
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    r["after"]["seconds"] = json!(100);
+                    s.db.execute(
+                        "UPDATE attempts SET body=? WHERE id=?",
+                        params![r.to_string(), id],
+                    )
+                    .unwrap();
+                }
+                "unknown" => {
+                    s.db.execute("INSERT INTO attempts VALUES ('another','unknown','{}')", [])
+                        .unwrap();
+                }
+                "other_worker" => prior["worker_sha256"] = json!("unsupported-worker"),
+                "other_account" => prior["config_binding_sha256"] = json!("foreign-binding"),
+                _ => unreachable!(),
+            }
+            assert!(
+                adopt_authorization(&s, &c, &id, &prior, &p).is_err(),
+                "{cause}"
+            );
+            assert_ne!(
+                private_json(&t.path().join(AUTHORIZATION)).unwrap()["mode"],
+                "auto"
+            );
+        }
+    }
+    #[test]
+    fn adopted_trial_cannot_hide_wire_changes_or_later_receipt_changes() {
+        let (t, s, c, p, prior, id) = legacy_trial_fixture();
+        let adopted = adopt_authorization(&s, &c, &id, &prior, &p).unwrap();
+        let mut tampered = adopted.clone();
+        tampered["trial_adoption"]["protocol_source_sha256"] = json!("changed-protocol");
+        atomic_json(&t.path().join(AUTHORIZATION), &tampered).unwrap();
+        assert!(enable_with_probe(&s, &c, &id, true, &p).is_err());
+        atomic_json(&t.path().join(AUTHORIZATION), &adopted).unwrap();
+        let mut r: Value = serde_json::from_str(
+            &s.db
+                .query_row("SELECT body FROM attempts WHERE id=?", [&id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        r["after"]["offset"] = json!(8);
+        s.db.execute(
+            "UPDATE attempts SET body=? WHERE id=?",
+            params![r.to_string(), id],
+        )
+        .unwrap();
+        assert!(enable_with_probe(&s, &c, &id, true, &p).is_err());
+    }
+    #[test]
+    fn legacy_adoption_requires_current_tls_and_unchanged_native_provenance() {
+        let (t, s, c, p, prior, id) = legacy_trial_fixture();
+        fs::remove_file(t.path().join(TLS_PROOF)).unwrap();
+        assert!(adopt_authorization(&s, &c, &id, &prior, &p).is_err());
+        tls(t.path(), &c, &p);
+        fs::write(
+            s.root.join("events/sealed/synthetic.log"),
+            "changed native provenance",
+        )
+        .unwrap();
+        assert!(adopt_authorization(&s, &c, &id, &prior, &p).is_err());
     }
     #[test]
     fn action_request_rejects_symlink_unknown_fields_and_binding_changes_before_network() {

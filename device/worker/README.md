@@ -118,3 +118,9 @@ PW2 统一存储 profile：SQLite `page_size=4096,max_page_count=1024`，账本�
 无法安全 compact 时应导出、人工诊断，不能删除 ledger 重新开始。即使 compact 后原始日志的重复复制件再次出现，保留的 ID 和 counter 范围也能阻断重复上传。
 
 设备计时只解析真实 `OpenBook` 到原生 `CloseBook` 或 `ReaderBooklet stop`/`End of stop method` 的完整窗口。同一书后续重新打开会独立形成计数窗口；不会把已确认的旧段和后读段合成重叠区间，也不会裁出未关闭的尾部。秒级日志中 stop 与 End of stop 同秒时，以真实同秒 stop 证据配对，防止日志去重排序改变其先后造成漏采。
+
+明确的 `adopt-and-enable` 动作可承接已发布 `2430ce27…75420` 执行的真实短试传：仅允许该精确前代二进制，且当前 `protocol.rs` 和 `network.rs` 必须与其构建来源逐字节相同。需新 worker 在真实设备完成 TLS 自检，原配置、账号、设备、内核及原授权时间全部相符，并通过当前账号真实 GET 核验原计划的书籍、日期增量和位置。只更新本地对账结果，不重发原试传；原 plan 和执行者 SHA 保持不变。新的 `experimental-authorization.json` 内嵌独立 `trial_adoption` 证据及完整旧授权，明确原 POST 由旧 ELF 执行、新 ELF 未执行该 POST。请求沿用 schema 1，action 为 `adopt-and-enable`，plan_id 为原真实计划，并明确两个实验接受字段；新 TLS 后不要先重新授权覆盖原 proof。成功后在同一进程处理积压。
+
+已收到明确 ack 的上传最多执行 8 轮只读回查，间隔约 2 秒，仅在增量为 0 或预期秒数且位置未变时继续；30 秒以后不启动新轮，单轮两个请求各有 20 秒限时。取消时收尾当前一对 GET。自然唤醒或联网后的下次同步会先只读复核待核验 ack，精确匹配后才继续新上传；unknown 和未确认回执不会被自动重发。延迟复核成功时保留 `original_after/original_day_after`，并将真实新 GET 保存为 canonical `after/day_after`。
+
+若确认回执对应的书籍或日期统计仍在等待刷新，worker 会尝试创建私有零字节 `readonly-recheck.pending` 提示。采集器安全消费后，仅在设备仍醒着、已联网且明确退出阅读并空闲时，于 60 秒后再运行只读核验；不设置 RTC、不主动联网、不阻止休眠。未知结果、异常增量或位置变化不创建提示。手动 KUAL worker 返回后用固定控制 `maintenance check-readonly-hint` 通知采集器检查提示，控制本身不改变电源、网络、阅读或缺口状态。
