@@ -34,11 +34,11 @@ class ComponentRepairTests(unittest.TestCase):
         self.old={name:(self.root/name).read_bytes() for name in ('bin/ksync-worker','bin/ksync-collector','bin/ksync-event-adapter','install/common.sh','install/control.sh','package-manifest.json')}
         self.tool('lipc-get-prop','#!/bin/sh\nprintf "1\\n"\n')
         self.tool('stop','#!/bin/sh\nprintf "stop %s\\n" "$1" >> "$TEST_BASE/calls"\n')
-        self.tool('initctl','#!/bin/sh\nprintf "%s stop/waiting\\n" "$2"\n')
+        self.tool('initctl','#!/bin/sh\nif [ "${TEST_LIVE:-}" = 1 ];then case "$2" in kindle-native-sync) pid=4242;; *) pid=4243;; esac;printf "%s start/running, process %s\\n" "$2" "$pid";else printf "%s stop/waiting\\n" "$2";fi\n')
         self.tool('sync','#!/bin/sh\nexit 0\n')
         self.tool('du','#!/bin/sh\ncase "$*" in *ksync-worker*) printf "5120\\tfixture\\n";; *) printf "4\\tfixture\\n";; esac\n')
         self.tool('cp','#!'+sys.executable+'\nimport os,sys\nfrom pathlib import Path\nif os.environ.get("TEST_FAIL_WORKER_COPY") and sys.argv[-1].endswith("bin/ksync-worker.repair"):raise SystemExit(9)\nos.execv("/bin/cp",["/bin/cp",*sys.argv[1:]])\n')
-        body=(HERE/'device/kual/repair-components.sh').read_text().replace('PATH=/sbin:/usr/sbin:/bin:/usr/bin','PATH='+shlex.quote(self.env['PATH'])).replace('PACKAGE=/mnt/us/kindle-native-sync-package','PACKAGE='+shlex.quote(str(self.package))).replace('ROOT=/var/local/kindle-native-sync','ROOT='+shlex.quote(str(self.root))).replace('OUT=/mnt/us/.kindle-native-sync-export','OUT='+shlex.quote(str(self.out)))
+        body=(HERE/'device/kual/repair-components.sh').read_text().replace('PATH=/sbin:/usr/sbin:/bin:/usr/bin','PATH='+shlex.quote(self.env['PATH'])).replace('PACKAGE=/mnt/us/kindle-native-sync-package','PACKAGE='+shlex.quote(str(self.package))).replace('ROOT=/var/local/kindle-native-sync','ROOT='+shlex.quote(str(self.root))).replace('OUT=/mnt/us/.kindle-native-sync-export','OUT='+shlex.quote(str(self.out))).replace('/proc/',str(self.base/'proc')+'/')
         self.script=self.base/'repair.sh';self.script.write_text(body)
         self.sums()
 
@@ -47,8 +47,15 @@ class ComponentRepairTests(unittest.TestCase):
     def sums(self):
         paths=sorted(p for p in self.package.rglob('*') if p.is_file() and p.name!='SHA256SUMS')
         (self.package/'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+str(p.relative_to(self.package))+'\n' for p in paths))
-    def run_repair(self,flag=True,**env):
-        return subprocess.run(['sh',str(self.script),*(['--unsubmitted-worker-upgrade'] if flag else [])],env={**self.env,**env},capture_output=True,text=True,timeout=10)
+    def run_repair(self,flag=True,live=False,**env):
+        return subprocess.run(['sh',str(self.script),*(['--unsubmitted-worker-upgrade'] if flag else []),*(['--worker-only-live-collector'] if live else [])],env={**self.env,**env},capture_output=True,text=True,timeout=10)
+    def live_fixture(self):
+        self.env['TEST_LIVE']='1'
+        for pid,name in [(4242,'ksync-collector'),(4243,'ksync-event-adapter')]:
+            (self.root/'bin'/name).write_bytes((self.package/'bin'/name).read_bytes())
+            self.old['bin/'+name]=(self.root/'bin'/name).read_bytes()
+            path=self.base/'proc'/str(pid);path.mkdir(parents=True)
+            (path/'exe').symlink_to(self.root/'bin'/name)
     def assert_private(self):
         for name,body in self.private.items():self.assertEqual((self.root/name).read_text(),body)
     def assert_old(self):
@@ -86,6 +93,32 @@ class ComponentRepairTests(unittest.TestCase):
                 (self.root/'.component-repair').unlink(missing_ok=True)
                 self.assertNotEqual(self.run_repair(**env).returncode,0);self.assert_old();self.assert_private()
                 self.assertTrue((self.root/'disabled').exists());self.assertTrue((self.root/'.component-repair').exists())
+
+    def test_live_worker_upgrade_preserves_event_inodes_and_enabled_state(self):
+        self.live_fixture()
+        inodes={name:(self.root/'bin'/name).stat().st_ino for name in ('ksync-collector','ksync-event-adapter')}
+        result=self.run_repair(live=True);self.assertEqual(result.returncode,0,result.stderr)
+        for name,ino in inodes.items():self.assertEqual((self.root/'bin'/name).stat().st_ino,ino)
+        self.assertFalse((self.root/'disabled').exists());self.assert_private()
+        calls=(self.base/'calls').read_text();self.assertNotIn('stop ',calls);self.assertNotIn('control enable',calls)
+        self.assertTrue(json.loads((self.out/'component-repair-result.json').read_text())['live_collector_preserved'])
+        self.assertEqual((self.root/'install/common.sh').read_bytes(),self.old['install/common.sh'])
+
+    def test_live_option_requires_explicit_unsubmitted_and_identical_event_binaries(self):
+        self.live_fixture()
+        self.assertNotEqual(self.run_repair(flag=False,live=True).returncode,0)
+        (self.root/'bin/ksync-collector').write_text('different event binary')
+        self.assertNotEqual(self.run_repair(live=True).returncode,0)
+        self.assertFalse((self.root/'disabled').exists());self.assert_private()
+
+    def test_live_worker_gate_and_rollback_preserve_disabled_marker(self):
+        self.live_fixture();(self.root/'disabled').write_text('already disabled')
+        self.status.write_text(json.dumps({'attempts':1,'unknown_batches':0,'auto_sync_enabled':False}))
+        self.assertNotEqual(self.run_repair(live=True).returncode,0);self.assert_old();self.assert_private()
+        self.status.write_text(json.dumps({'attempts':0,'unknown_batches':0,'auto_sync_enabled':False}))
+        self.assertNotEqual(self.run_repair(live=True,TEST_FAIL_WORKER_COPY='1').returncode,0)
+        self.assert_old();self.assert_private();self.assertEqual((self.root/'disabled').read_text(),'already disabled')
+        self.assertNotIn('stop ',(self.base/'calls').read_text())
 
 
 if __name__=='__main__':unittest.main()

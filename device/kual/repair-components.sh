@@ -5,11 +5,15 @@ umask 077
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
 export PATH
 upgrade_unsubmitted=false
-case "${1:-}" in
-    '') [ "$#" = 0 ] || exit 2;;
-    --unsubmitted-worker-upgrade) [ "$#" = 1 ] || exit 2;upgrade_unsubmitted=true;;
-    *) echo 'Unsupported component repair action.' >&2;exit 2;;
-esac
+live_collector=false
+for option in "$@";do
+    case "$option" in
+        --unsubmitted-worker-upgrade) [ "$upgrade_unsubmitted" = false ] || exit 2;upgrade_unsubmitted=true;;
+        --worker-only-live-collector) [ "$live_collector" = false ] || exit 2;live_collector=true;;
+        *) echo 'Unsupported component repair action.' >&2;exit 2;;
+    esac
+done
+[ "$live_collector" = false ] || [ "$upgrade_unsubmitted" = true ] || exit 2
 PACKAGE=/mnt/us/kindle-native-sync-package
 ROOT=/var/local/kindle-native-sync
 OUT=/mnt/us/.kindle-native-sync-export
@@ -31,8 +35,28 @@ if [ "$expected" != "$actual" ];then
     worker_unchanged=false
 fi
 runtime_components='bin/ksync-collector bin/ksync-event-adapter install/common.sh install/control.sh'
-if [ "$upgrade_unsubmitted" = true ];then runtime_components="$runtime_components bin/ksync-worker";fi
+if [ "$live_collector" = true ];then
+    runtime_components='bin/ksync-worker'
+    # Preserve actual native-reader state only when the running event components
+    # are already exactly this candidate. Never replace their executable inode.
+    for name in ksync-collector ksync-event-adapter;do
+        [ -f "$ROOT/bin/$name" ] && [ ! -L "$ROOT/bin/$name" ] || exit 1
+        [ "$(sha256sum "$PACKAGE/bin/$name" | awk '{print $1}')" = "$(sha256sum "$ROOT/bin/$name" | awk '{print $1}')" ] || { echo 'Live event components differ from candidate.';exit 1; }
+    done
+elif [ "$upgrade_unsubmitted" = true ];then runtime_components="$runtime_components bin/ksync-worker";fi
 backup_components="$runtime_components package-manifest.json"
+verify_live_jobs() {
+    for job in kindle-native-sync-events kindle-native-sync;do
+        if job_state=$(initctl status "$job" 2>/dev/null);then :;else return 1;fi
+        case "$job_state" in "$job start/running, process "*) :;; *) return 1;; esac
+        job_pid=${job_state##* }
+        case "$job_pid" in ''|*[!0-9]*) return 1;; esac
+        [ "$job_pid" -gt 0 ] && [ -d "/proc/$job_pid" ] || return 1
+        if [ "$job" = kindle-native-sync ];then job_exe=ksync-collector;else job_exe=ksync-event-adapter;fi
+        [ "$(readlink "/proc/$job_pid/exe" 2>/dev/null)" = "$ROOT/bin/$job_exe" ] || return 1
+    done
+}
+if [ "$live_collector" = true ];then verify_live_jobs || { echo 'Cannot verify both unchanged event services are running.';exit 1; };fi
 SNAP=$OUT/private-repair-$(date -u +%Y%m%dT%H%M%S)-$$
 mkdir "$SNAP" "$SNAP/sealed" "$SNAP/components"
 ls -ldn "$ROOT" "$ROOT/config.json" "$ROOT/auth.json" "$ROOT/control.fifo" "$ROOT/adapter-control.fifo" > "$SNAP/permissions-before.txt" 2>&1 || :
@@ -41,13 +65,15 @@ ls -ldn "$ROOT" "$ROOT/config.json" "$ROOT/auth.json" "$ROOT/control.fifo" "$ROO
 [ ! -e "$ROOT/.preview-upgrade" ] && [ ! -L "$ROOT/.preview-upgrade" ] && [ ! -e "$ROOT/.install-transaction" ] && [ ! -L "$ROOT/.install-transaction" ] || exit 1
 enabled=1
 [ ! -e "$ROOT/disabled" ] || enabled=0
-: > "$ROOT/disabled"
-stop kindle-native-sync-events >/dev/null 2>&1 || :
-stop kindle-native-sync >/dev/null 2>&1 || :
-for job in kindle-native-sync-events kindle-native-sync;do
-    if job_state=$(initctl status "$job" 2>/dev/null);then :;else echo 'Cannot verify stopped project service.';exit 1;fi
-    case "$job_state" in "$job stop/waiting"*) :;; *) echo 'Service did not stop.';exit 1;; esac
-done
+if [ "$live_collector" = false ];then
+    : > "$ROOT/disabled"
+    stop kindle-native-sync-events >/dev/null 2>&1 || :
+    stop kindle-native-sync >/dev/null 2>&1 || :
+    for job in kindle-native-sync-events kindle-native-sync;do
+        if job_state=$(initctl status "$job" 2>/dev/null);then :;else echo 'Cannot verify stopped project service.';exit 1;fi
+        case "$job_state" in "$job stop/waiting"*) :;; *) echo 'Service did not stop.';exit 1;; esac
+    done
+fi
 "$PACKAGE/bin/ksync-collector" --root "$ROOT" --repair-private-state
 if [ "$upgrade_unsubmitted" = true ];then
     # The old executable is authoritative about its own account-write ledger.
@@ -89,20 +115,30 @@ cleanup() {
     trap - EXIT HUP INT TERM
     set +e
     if [ "$changed" = 1 ];then
-        (cd "$SNAP/components" && sha256sum -c SHA256SUMS) >/dev/null || { echo 'Recovery checksum failed; collection disabled; preserve evidence.';exit 1; }
+        (cd "$SNAP/components" && sha256sum -c SHA256SUMS) >/dev/null || { echo 'Recovery checksum failed; retain prior service state and evidence.';exit 1; }
         for name in $backup_components;do
             safe=$(printf '%s' "$name" | tr / _)
-            cp "$SNAP/components/$safe" "$ROOT/$name"
+            if [ "$live_collector" = true ];then
+                # A collect-only worker may still have the current executable
+                # open. Restore by rename, never truncate a live executable.
+                [ ! -e "$ROOT/$name.restore" ] && [ ! -L "$ROOT/$name.restore" ] || exit 1
+                cp "$SNAP/components/$safe" "$ROOT/$name.restore" || exit 1
+                if [ "$name" = package-manifest.json ];then chmod 600 "$ROOT/$name.restore";else chmod 700 "$ROOT/$name.restore";fi
+                [ "$(sha256sum "$ROOT/$name.restore" | awk '{print $1}')" = "$(sha256sum "$SNAP/components/$safe" | awk '{print $1}')" ] || exit 1
+                mv "$ROOT/$name.restore" "$ROOT/$name" || exit 1
+            else cp "$SNAP/components/$safe" "$ROOT/$name";fi
         done
         for name in $runtime_components;do chmod 700 "$ROOT/$name";done
         chmod 600 "$ROOT/package-manifest.json"
-        echo 'Component repair incomplete; collection disabled; private data retained.'
+        if [ "$live_collector" = true ];then echo 'Worker repair incomplete; live event services and prior enable state retained.'
+        else echo 'Component repair incomplete; collection disabled; private data retained.';fi
     fi
     sync
     exit "$code"
 }
 trap cleanup EXIT
 trap 'exit 129' HUP;trap 'exit 130' INT;trap 'exit 143' TERM
+if [ "$live_collector" = true ];then verify_live_jobs || exit 1;fi
 for name in $runtime_components;do
     [ ! -e "$ROOT/$name.repair" ] && [ ! -L "$ROOT/$name.repair" ] || exit 1
     # Stage one public component at a time, preserving the system plus worker
@@ -124,9 +160,9 @@ mv "$ROOT/package-manifest.json.repair" "$ROOT/package-manifest.json"
 "$ROOT/bin/ksync-collector" --root "$ROOT" --repair-private-state
 changed=0
 rm "$ROOT/.component-repair"
-if [ "$enabled" = 1 ];then sh "$ROOT/install/control.sh" enable;fi
+if [ "$live_collector" = false ] && [ "$enabled" = 1 ];then sh "$ROOT/install/control.sh" enable;fi
 # A restarted collector deliberately starts with unknown reader state. The
 # user must really open/close a book before the separate prepare action.
 sh "$ROOT/install/control.sh" export
-printf '{"schema_version":1,"state":"components_repaired","worker_unchanged":%s,"unsubmitted_worker_upgrade":%s,"account_time_write_performed":false}\n' "$worker_unchanged" "$upgrade_unsubmitted" > "$OUT/component-repair-result.json"
+printf '{"schema_version":1,"state":"components_repaired","worker_unchanged":%s,"unsubmitted_worker_upgrade":%s,"live_collector_preserved":%s,"account_time_write_performed":false}\n' "$worker_unchanged" "$upgrade_unsubmitted" "$live_collector" > "$OUT/component-repair-result.json"
 sync
