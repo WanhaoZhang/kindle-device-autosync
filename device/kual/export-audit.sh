@@ -12,7 +12,18 @@ OUT=/mnt/us/.kindle-native-sync-export
 mkdir -p "$OUT"
 SNAP=$OUT/private-audit-$(date -u +%Y%m%dT%H%M%S)-$$
 mkdir "$SNAP" "$SNAP/sealed" "$SNAP/parsed"
-"$ROOT/bin/ksync-worker" --root "$ROOT" export --out "$SNAP/parsed"
+export_attempt=1
+while [ "$export_attempt" -le 10 ];do
+    if "$ROOT/bin/ksync-worker" --root "$ROOT" export --out "$SNAP/parsed" > "$SNAP/worker-export.json.partial" 2> "$SNAP/worker-export-error.txt";then
+        mv "$SNAP/worker-export.json.partial" "$SNAP/worker-export.json"
+        break
+    fi
+    if [ "$export_attempt" -ge 10 ] || ! grep -Fxq 'worker stopped: worker already running' "$SNAP/worker-export-error.txt";then
+        cat "$SNAP/worker-export-error.txt" >&2;exit 1
+    fi
+    sleep 3
+    export_attempt=$((export_attempt+1))
+done
 count=0
 for file in "$ROOT/events/sealed/"segment-*.log;do
     [ -e "$file" ] || continue
