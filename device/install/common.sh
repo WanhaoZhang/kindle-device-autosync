@@ -46,7 +46,8 @@ ksync_set_root_mount() {
     case "$1" in ro) ksync_mount_wanted=read_only;; rw) ksync_mount_wanted=read_write;; *) return 1;; esac
     ksync_mntroot_exit=127
     if command -v mntroot >/dev/null 2>&1;then
-        if mntroot "$1" >/dev/null;then ksync_mntroot_exit=0;else ksync_mntroot_exit=$?;fi
+        # Keep native diagnostics on stderr, never in a JSON result stream.
+        if mntroot "$1" >&2;then ksync_mntroot_exit=0;else ksync_mntroot_exit=$?;fi
     fi
     ksync_mount_observed=$(ksync_root_mount_state)
     if [ "$ksync_mount_observed" = "$ksync_mount_wanted" ];then
@@ -54,6 +55,23 @@ ksync_set_root_mount() {
             printf 'Native mntroot exit=%s; kernel root mount verified as %s.\n' "$ksync_mntroot_exit" "$ksync_mount_observed" >&2
         fi
         return 0
+    fi
+    if [ "$ksync_mount_wanted" = read_only ] && [ "$ksync_mount_observed" = read_write ];then
+        # The stock helper consults /etc/mtab and can skip the real syscall, or
+        # return zero after mount failed. Let completed writes settle, then make
+        # one ordinary read-only remount without updating that userspace table.
+        # This is not a forced mount: the kernel still rejects active writers.
+        printf 'Native read-only transition incomplete; syncing before one ordinary no-mtab remount.\n' >&2
+        sync || return 1
+        sleep 1 || return 1
+        ksync_remount_exit=0
+        if /bin/mount -n -o remount,ro / >&2;then :;else ksync_remount_exit=$?;fi
+        ksync_mount_observed=$(ksync_root_mount_state)
+        if [ "$ksync_mount_observed" = read_only ];then
+            printf 'Kernel root read-only verified after ordinary remount (exit=%s).\n' "$ksync_remount_exit" >&2
+            return 0
+        fi
+        printf 'Ordinary read-only remount not verified: observed=%s mount_exit=%s.\n' "$ksync_mount_observed" "$ksync_remount_exit" >&2
     fi
     printf 'Root mount transition not verified: desired=%s observed=%s native_exit=%s.\n' "$ksync_mount_wanted" "$ksync_mount_observed" "$ksync_mntroot_exit" >&2
     return 1

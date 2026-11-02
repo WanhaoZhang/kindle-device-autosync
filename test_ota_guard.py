@@ -50,7 +50,7 @@ class OtaGuardTests(unittest.TestCase):
         self.package = self.base / 'package'
         (self.package / 'ota').mkdir(parents=True)
         (self.package / 'install').mkdir()
-        common = (HERE / 'device/install/common.sh').read_text()
+        common = (HERE / 'device/install/common.sh').read_text().replace('/bin/mount -n', 'false -n').replace('sleep 1', ':')
         common = common.replace('ROOT=/var/local/kindle-native-sync', 'ROOT=' + str(self.root))
         common = common.replace('/proc/mounts', str(self.mounts))
         common += '\nrequire_device() { return 0; }\n'

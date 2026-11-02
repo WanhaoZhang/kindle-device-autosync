@@ -318,7 +318,7 @@ class BootstrapProbeTests(unittest.TestCase):
         for name in ['initctl','lipc-wait-event','gzip','sha256sum','sync']:self.command(name,'exit 0\n')
         private=self.base/'private';private.mkdir()
         mounts=self.base/'mounts';mounts.write_text('rootfs / rootfs rw 0 0\n/dev/root / ext3 ro,noatime 0 0\n')
-        common=(HERE/'device/install/common.sh').read_text().replace('ROOT=/var/local/kindle-native-sync','ROOT='+str(private)).replace('/proc/mounts',str(mounts))
+        common=(HERE/'device/install/common.sh').read_text().replace('ROOT=/var/local/kindle-native-sync','ROOT='+str(private)).replace('/proc/mounts',str(mounts)).replace('/bin/mount -n', 'false -n').replace('sleep 1', ':')
         (self.package/'install/common.sh').write_text(common+'\nfirmware_ok() { return 0; }\n')
         usid=self.base/'usid';usid.write_text('B0D4SYNTHETIC_FULL_SERIAL_NEVER_EXPORT')
         mem=self.base/'meminfo';mem.write_text('MemTotal: 254652 kB\n')

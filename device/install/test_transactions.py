@@ -26,7 +26,7 @@ class InstallTransactions(unittest.TestCase):
         for p in SOURCE.glob('*.sh'):
             body=p.read_text().replace('JOBS=/etc/upstart','JOBS='+str(self.jobs))
             (self.install/p.name).write_text(body)
-        common=(SOURCE/'common.sh').read_text().replace('ROOT=/var/local/kindle-native-sync','ROOT='+str(self.root)).replace('/proc/mounts',str(self.base/'root-mounts'))
+        common=(SOURCE/'common.sh').read_text().replace('ROOT=/var/local/kindle-native-sync','ROOT='+str(self.root)).replace('/proc/mounts',str(self.base/'root-mounts')).replace('/bin/mount -n', 'false -n').replace('sleep 1', ':')
         common+='\nrequire_device() { :; }\nspace_kib() { printf "131072\\n"; }\n'
         (self.install/'common.sh').write_text(common)
         for name in ('ksync-collector','ksync-worker','ksync-event-adapter'):
@@ -222,11 +222,16 @@ class RootMountPostconditions(unittest.TestCase):
         self.base=Path(self.tmp.name);self.mounts=self.base/'mounts';self.calls=self.base/'calls'
         self.commands=self.base/'commands';self.commands.mkdir()
         self.native_code=self.base/'native-exit';self.native_code.write_text('0')
+        self.fallback_code=self.base/'fallback-exit';self.fallback_code.write_text('1')
+        self.fallback_target=self.base/'fallback-target'
         tool=self.commands/'mntroot'
         tool.write_text('#!/bin/sh\nprintf \'%s\\n\' "$1" >> '+str(self.calls)+'\nexit "$(cat '+str(self.native_code)+')"\n')
         tool.chmod(0o700)
+        fallback=self.commands/'mount'
+        fallback.write_text('#!/bin/sh\nprintf \'fallback %s\\n\' "$*" >> '+str(self.calls)+'\nif [ -f '+str(self.fallback_target)+' ];then cp '+str(self.fallback_target)+' '+str(self.mounts)+';fi\nexit "$(cat '+str(self.fallback_code)+')"\n')
+        fallback.chmod(0o700)
         self.common=self.base/'common.sh'
-        self.common.write_text((SOURCE/'common.sh').read_text().replace('/proc/mounts',str(self.mounts)))
+        self.common.write_text((SOURCE/'common.sh').read_text().replace('/proc/mounts',str(self.mounts)).replace('/bin/mount -n',str(fallback)+' -n').replace('sleep 1', ':'))
         self.env={**os.environ,'PATH':str(self.commands)+':/usr/bin:/bin'}
 
     def run_guard(self,entries,guard='root_ro',native=0):
@@ -236,7 +241,30 @@ class RootMountPostconditions(unittest.TestCase):
     def test_zero_native_exit_cannot_hide_root_remaining_writable(self):
         r=self.run_guard('rootfs / rootfs rw 0 0\n/dev/root / ext3 rw,noatime 0 0\n')
         self.assertEqual(r.returncode,1);self.assertIn('observed=read_write',r.stderr)
-        self.assertIn('native_exit=0',r.stderr);self.assertEqual(self.calls.read_text(),'ro\n')
+        self.assertIn('native_exit=0',r.stderr);self.assertEqual(self.calls.read_text(),'ro\nfallback -n -o remount,ro /\n')
+
+    def test_native_false_success_recovers_only_after_kernel_verified_normal_remount(self):
+        self.fallback_code.write_text('0')
+        self.fallback_target.write_text('rootfs / rootfs rw 0 0\n/dev/root / ext3 ro,noatime 0 0\n')
+        r=self.run_guard('rootfs / rootfs rw 0 0\n/dev/root / ext3 rw,noatime 0 0\n')
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertIn('Kernel root read-only verified',r.stderr)
+        self.assertEqual(self.calls.read_text(),'ro\nfallback -n -o remount,ro /\n')
+
+    def test_remount_false_success_still_rejects_writable_kernel_state(self):
+        self.fallback_code.write_text('0')
+        r=self.run_guard('/dev/root / ext3 rw 0 0\n')
+        self.assertEqual(r.returncode,1)
+        self.assertIn('mount_exit=0',r.stderr)
+
+    def test_unknown_or_writable_request_never_calls_readonly_fallback(self):
+        r=self.run_guard('rootfs / rootfs rw 0 0\n')
+        self.assertEqual(r.returncode,1)
+        self.assertEqual(self.calls.read_text(),'ro\n')
+        self.calls.unlink()
+        r=self.run_guard('/dev/root / ext3 ro 0 0\n','root_rw')
+        self.assertEqual(r.returncode,1)
+        self.assertEqual(self.calls.read_text(),'rw\n')
 
     def test_rootfs_rw_does_not_override_real_root_ro(self):
         r=self.run_guard('/dev/root / ext3 ro,noatime 0 0\nrootfs / rootfs rw 0 0\n')
