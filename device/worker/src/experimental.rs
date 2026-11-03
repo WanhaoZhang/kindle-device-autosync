@@ -330,13 +330,16 @@ fn require_clean_activation(store: &Store) -> Result<()> {
 /// Carry forward an already enabled installation across this queue-only upgrade.
 /// This does not create an authorization for a previously disabled installation.
 pub fn resume_isolated_autosync(store: &Store) -> Result<Value> {
+    resume_isolated_with_probe(store, &actual_device())
+}
+
+fn resume_isolated_with_probe(store: &Store, probe: &Value) -> Result<Value> {
     const PRIOR_WORKER: &str = "f327c8bfc6605093a413aff88462c2056f36c54f74cb3e6e3669268803d22350";
     let c = Config::load(&store.root)?;
-    device_gate(&store.root, &c)?;
+    actual_supported(probe)?;
     store.bind(&c)?;
     Auth::load(&store.root, &c)?;
-    let probe = actual_device();
-    let current = check_tls(&store.root, &c, &probe)?;
+    let current = check_tls(&store.root, &c, probe)?;
     let mut prior = private_json(&store.root.join(AUTHORIZATION))?;
     if prior["worker_sha256"] == current["worker_sha256"] {
         checked_authorization(&store.root, &c, &probe, true)?;
@@ -859,6 +862,32 @@ mod tests {
                 .validation
                 .protocol_validation
         );
+    }
+    #[test]
+    fn queue_upgrade_checks_new_tls_and_old_trial_without_requiring_new_authorization() {
+        let (t, s, c, p, original, id) = legacy_trial_fixture();
+        let mut adopted = adopt_authorization(&s, &c, &id, &original, &p).unwrap();
+        adopted["worker_sha256"] =
+            json!("f327c8bfc6605093a413aff88462c2056f36c54f74cb3e6e3669268803d22350");
+        adopted["trial_adoption"]["current_worker_sha256"] = adopted["worker_sha256"].clone();
+        adopted["mode"] = json!("auto");
+        adopted["accept_unverified_protocol"] = json!(true);
+        adopted["confirmed_trial_plan_id"] = json!(id);
+        atomic_json(&t.path().join(AUTHORIZATION), &adopted).unwrap();
+        assert!(checked_authorization(t.path(), &c, &p, true).is_err());
+        assert!(resume_isolated_autosync(&s).is_err()); // Actual Mac is not an ARM PW2.
+        fs::remove_file(t.path().join(TLS_PROOF)).unwrap();
+        assert!(resume_isolated_with_probe(&s, &p).is_err());
+        tls(t.path(), &c, &p);
+        resume_isolated_with_probe(&s, &p).unwrap();
+        assert!(checked_authorization(t.path(), &c, &p, true).is_ok());
+        resume_isolated_with_probe(&s, &p).unwrap();
+        assert_eq!(s.status().unwrap()["attempts"], 1);
+        let state: String = s.db.query_row("SELECT state FROM attempts WHERE id=?", [&id], |r| r.get(0)).unwrap();
+        assert_eq!(state, "confirmed");
+        adopted["mode"] = json!("trial");
+        atomic_json(&t.path().join(AUTHORIZATION), &adopted).unwrap();
+        assert!(resume_isolated_with_probe(&s, &p).is_err());
     }
     #[test]
     fn legacy_adoption_never_promotes_partial_unknown_or_foreign_execution() {

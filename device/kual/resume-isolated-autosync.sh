@@ -55,6 +55,11 @@ if [ "$installed_sha" = "$OLD_SHA" ];then
     [ ! -L "$NEXT" ] && [ ! -L "$BACKUP" ]
     if [ -e "$BACKUP" ];then regular "$BACKUP" && [ "$(digest "$BACKUP")" = "$OLD_SHA" ]
     else ln "$WORKER" "$BACKUP";fi
+    if [ -e "$NEXT" ] && regular "$NEXT" &&
+        [ "$(digest "$NEXT")" = 2841b2d6bdc446a7088954a3830d7094d601a0a3c23c044238844d1798010800 ];then
+        # This exact candidate failed before authorization or replacement.
+        rm "$NEXT"
+    fi
     if [ -e "$NEXT" ];then regular "$NEXT" && [ "$(digest "$NEXT")" = "$candidate_sha" ]
     else
         bytes=$(wc -c < "$UPDATE/ksync-worker")
