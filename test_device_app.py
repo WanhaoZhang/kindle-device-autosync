@@ -107,7 +107,44 @@ class DeviceAppTests(unittest.TestCase):
                 return {'books':[{'bookId':'CB_personal','title':'Synthetic Book personal','author':'A'}]}
         with patch.object(device_app,'Transport',Fake):result=self.app.dispatch('/api/search',{'keyword':'Synthetic'})
         self.assertEqual({x['bookId'] for x in result['books']},{'123','CB_personal'})
+        self.assertEqual(result['books'][0]['source'],'uploaded')
         self.assertTrue(all(method=='GET' for method,_ in Fake.calls));self.assertNotIn('DO_NOT_RETURN',json.dumps(result))
+
+    def test_uploaded_search_includes_books_after_200_and_skips_store(self):
+        class Fake:
+            calls=[]
+            def request(self,method,url,**kwargs):
+                self.calls.append((method,url))
+                if '/store/' in url:raise AssertionError('Uploaded-only search must not call store')
+                return {'books':[{'bookId':str(i),'title':'Unrelated'} for i in range(450)]+[
+                    {'bookId':'CB_own','title':'Synthetic Book','author':'A'},
+                    {'bookId':'123','title':'Synthetic Book','author':'A'}]}
+        with patch.object(device_app,'Transport',Fake):
+            result=self.app.dispatch('/api/search',{'keyword':'Synthetic','source':'uploaded'})
+        self.assertEqual([b['bookId'] for b in result['books']],['CB_own'])
+        self.assertEqual(result['books'][0]['source'],'uploaded')
+        self.assertEqual(len(Fake.calls),1)
+
+    def test_uploaded_shelf_failure_is_not_reported_as_no_matches(self):
+        class Fake:
+            def request(self,*args,**kwargs):raise device_app.BridgeError('接口返回 HTTP 401')
+        with patch.object(device_app,'Transport',Fake):
+            with self.assertRaises(device_app.BridgeError):
+                self.app.dispatch('/api/search',{'keyword':'Synthetic','source':'uploaded'})
+        with self.assertRaises(ValueError):
+            self.app.dispatch('/api/search',{'keyword':'Synthetic','source':'unknown'})
+
+    def test_uploads_take_priority_when_store_fills_result_limit(self):
+        class Fake:
+            def request(self,method,url,**kwargs):
+                if '/store/' in url:
+                    return {'books':[{'bookId':str(i),'title':'Synthetic Book'} for i in range(45)]}
+                return {'books':[{'bookId':'CB_own','title':'Synthetic Book'}]}
+        with patch.object(device_app,'Transport',Fake):
+            result=self.app.dispatch('/api/search',{'keyword':'Synthetic'})
+        self.assertEqual(result['books'][0]['bookId'],'CB_own')
+        self.assertEqual(len(result['books']),40)
+        self.assertTrue(result['truncated'])
 
     def test_mapping_validation_does_not_accept_guessed_blank_ids(self):
         for rows in [None,[{'local_book_id':'A','weread_book_id':''}],[{'local_book_id':'A','weread_book_id':'1'},{'local_book_id':'A','weread_book_id':'2'}]]:
@@ -132,6 +169,13 @@ class DeviceAppTests(unittest.TestCase):
         self.assertEqual(candidate['title'], 'Candidate Title')
         self.assertIsNone(candidate['local_book_id'])
         self.assertEqual(candidate['candidate_id'], 'documents/Author/Exact File.mobi')
+
+    def test_book_inventory_does_not_depend_on_usb_diagnostic_reads(self):
+        (self.mount/'documents'/'Candidate.mobi').write_bytes(b'synthetic')
+        with patch.object(self.app,'state',side_effect=TimeoutError('diagnostic read stalled')):
+            result = self.app.book_candidates()
+        self.assertTrue(result['connected'])
+        self.assertEqual(len(result['books']),1)
 
     def test_candidate_save_requires_confirmation_and_preserves_active_mappings(self):
         (self.mount/'documents'/'Candidate.mobi').write_bytes(b'not parsed')

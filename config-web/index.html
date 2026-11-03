@@ -4,9 +4,10 @@
 <p class="note">这里可以一次选好几本新书，核对微信读书版本并保存到本机。候选清单部署到 Kindle 后才会用于自动同步。</p>
 <section id="bookPicker"><h2>给新书选择微信读书版本</h2>
 <p>先选 Kindle 里的书，再搜索并核对微信读书的作者和版本。保存后的候选对应留在本机，页面会列出待部署清单。</p>
-<button id="refreshBooks">刷新 Kindle 候选书</button>
+<p id="volumeMode" class="note" hidden></p><button id="refreshBooks">刷新 Kindle 候选书</button>
 <label>Kindle 候选书<select id="kindleBook"><option value="">请选择一本书</option></select></label><p id="candidateInfo" class="muted"></p>
 <label>搜索微信读书<input id="bookKeyword" type="text" placeholder="书名或作者"></label>
+<label>搜索来源<select id="bookSource"><option value="all">全部（优先显示我上传的书）</option><option value="uploaded">只看我上传的书</option><option value="store">只看书城</option></select></label>
 <button id="findBook">搜索版本</button>
 <label>微信读书目标版本<select id="wereadBook"><option value="">先搜索，再选择具体版本</option></select></label><p id="targetInfo" class="muted"></p>
 <label><input type="checkbox" id="confirmCandidate">我已核对作者与版本，确认这两边是同一本书。</label>
@@ -33,7 +34,7 @@
 'use strict';const $=id=>document.getElementById(id);let csrf=null,state=null,timer=null,dirty=false,candidates=[],targets=[];
 async function api(path,body){const headers={};if(body!==undefined){if(!csrf)csrf=(await api('/api/bootstrap')).csrf_token;headers['Content-Type']='application/json';headers['X-CSRF-Token']=csrf;}const r=await fetch(path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',credentials:'same-origin'});const v=await r.json();if(!r.ok||v.ok===false){if(r.status===403)csrf=null;throw new Error(v.error||'操作未完成');}return v.data??v;}
 function message(text,error=false){$('message').textContent=text;$('message').className=error?'error':'';}
-function buttons(){const fenced=!!state?.mac_upload_fenced;$('handoff').disabled=fenced||!state?.device_auth_ready||!state?.source||state.source.mode==='unselected'||!$('handoffConfirm').checked;$('export').disabled=!fenced||!state?.device_auth_ready||!state?.usb?.connected||!$('exportConfirm').checked;$('legacy').disabled=fenced;$('fresh').disabled=fenced;}
+function buttons(){const fenced=!!state?.mac_upload_fenced;$('handoff').disabled=fenced||!state?.device_auth_ready||!state?.source||state.source.mode==='unselected'||!$('handoffConfirm').checked;$('export').disabled=!fenced||!state?.device_auth_ready||!state?.usb?.connected||state?.usb?.read_only||!$('exportConfirm').checked;$('legacy').disabled=fenced;$('fresh').disabled=fenced;}
 async function refresh(){state=await api('/api/device');const usb=state.usb||{};$('probe').textContent=usb.connected?`Kindle 已连接，固件 ${usb.firmware||'未知'}。请核对导出的 root 探针。`:'Kindle 尚未连接。';$('probeDetail').textContent=JSON.stringify({probe:usb.root_probe,install:state.install_result,services:state.service_probe,local_self_test:state.self_test,tls_self_test:state.tls_self_test},null,2);$('sourceState').textContent=state.source?.mode==='legacy'?`已选择旧实例：${state.source.legacy_project}`:state.source?.mode==='new'?'已明确选择新安装。':'尚未选择安装方式。';if(!$('legacyPath').value&&state.known_legacy_projects?.length)$('legacyPath').value=state.known_legacy_projects[0];$('authState').textContent=state.device_auth_ready?'Kindle 专用凭据已保存。':'尚未完成 Kindle 专用扫码。';$('handoffState').textContent=state.mac_upload_fenced?'交接已登记；旧待核验数据继续保留。':'尚未交接上传权。';$('deviceState').textContent=JSON.stringify(state.device_status||{message:'尚未导出设备状态。'},null,2);if(!dirty)$('mappings').value=JSON.stringify(state.mappings||[],null,2);buttons();return state;}
 function action(id,fn){$(id).onclick=async()=>{try{await fn();}catch(e){message(e.message,true);}};}
 action('refresh',refresh);action('legacy',async()=>{await api('/api/source',{mode:'legacy',legacy_project:$('legacyPath').value});await refresh();message('已选择旧实例，尚未交接。');});
@@ -50,6 +51,7 @@ action('export',async()=>{const result=await api('/api/device/config',{confirmed
 $('handoffConfirm').onchange=buttons;$('exportConfirm').onchange=buttons;
 function candidateMessage(text,error=false){$('candidateMessage').textContent=text;$('candidateMessage').className=error?'error':'';}
 function pickedCandidate(){return candidates.find(book=>book.candidate_id===$('kindleBook').value);}
+function sourceLabel(book){return ({uploaded:'我上传的书',shelf:'我的书架',store:'书城'})[book.source]||'微信读书';}
 function pickedTarget(){return targets.find(book=>book.bookId===$('wereadBook').value);}
 function pickerButtons(){$('saveCandidate').disabled=!pickedCandidate()||!pickedTarget()||!$('confirmCandidate').checked;}
 function clearTargets(){targets=[];$('wereadBook').replaceChildren(new Option('先搜索，再选择具体版本',''));$('targetInfo').textContent='';$('confirmCandidate').checked=false;pickerButtons();}
@@ -74,6 +76,9 @@ async function refreshCandidates(){
  const previous=$('kindleBook').value;
  const result=await api('/api/books');candidates=result.books||[];
  $('kindleBook').replaceChildren(new Option('请选择一本书',''));
+ $('volumeMode').hidden=!result.read_only;
+ $('volumeMode').textContent=result.read_only?'当前通过只读连接查看 Kindle。可以选书并将对应保存到 Mac，导出到 Kindle 需等可写连接恢复。':'';
+ $('exportCandidates').disabled=!!result.read_only;
  candidates.forEach(book=>{
   const mark=book.saved?'【待部署】':book.mapping?'【已有对应】':'【未匹配】';
   $('kindleBook').add(new Option(mark+' '+book.title+(book.author?' · '+book.author:''),book.candidate_id));
@@ -87,7 +92,7 @@ action('refreshBooks',refreshCandidates);
 $('kindleBook').onchange=showCandidate;
 $('wereadBook').onchange=()=>{
  const book=pickedTarget();$('confirmCandidate').checked=false;
- $('targetInfo').textContent=book?[book.author,book.publisher,book.isbn?'ISBN '+book.isbn:'','书籍 ID '+book.bookId].filter(Boolean).join(' · '):'';
+ $('targetInfo').textContent=book?[sourceLabel(book),book.author,book.publisher,book.isbn?'ISBN '+book.isbn:'','书籍 ID '+book.bookId].filter(Boolean).join(' · '):'';
  pickerButtons();
 };
 $('confirmCandidate').onchange=pickerButtons;
@@ -96,12 +101,15 @@ action('findBook',async()=>{
  const candidate=$('kindleBook').value;clearTargets();$('findBook').disabled=true;
  candidateMessage('正在查询微信读书版本…');
  try{
-  const result=await api('/api/search',{keyword});
+  const result=await api('/api/search',{keyword,source:$('bookSource').value});
   if(candidate!==$('kindleBook').value)return;
   targets=result.books||[];
   $('wereadBook').replaceChildren(new Option(targets.length?'请选择准确版本':'没有找到结果，请换书名或作者',''));
-  targets.forEach(book=>$('wereadBook').add(new Option(book.title+' · '+(book.author||'作者未提供')+' · ID '+book.bookId,book.bookId)));
-  candidateMessage(targets.length?'找到 '+targets.length+' 个版本，请核对后选择。':'没有找到对应版本。个人导入书请先在微信读书里完成导入。');
+  targets.forEach(book=>$('wereadBook').add(new Option('【'+sourceLabel(book)+'】'+book.title+' · '+(book.author||'作者未提供')+' · ID '+book.bookId,book.bookId)));
+  let message=targets.length?'找到 '+targets.length+' 个版本，请核对后选择。':'没有找到对应版本。个人上传书请先在微信读书里完成导入，也可缩短关键词后搜索。';
+  if(!result.shelf_available)message+=' 个人书架暂未读取成功，当前结果不包含完整的个人上传书。';
+  if(result.truncated)message+=' 仅显示前 40 项，请缩短范围或改用更具体的关键词。';
+  candidateMessage(message);
  }catch(error){candidateMessage(error.message,true);}finally{$('findBook').disabled=false;}
 });
 action('saveCandidate',async()=>{

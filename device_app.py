@@ -84,10 +84,11 @@ class DeviceApp:
 
     def book_candidates(self):
         """Inventory metadata only. Filename candidates remain distinct from parsed IDs."""
-        state = self.state()
-        parsed = {row['local_book_id']: row for row in
-                  (state.get('device_status') or {}).get('books', [])}
-        mappings = {row['local_book_id']: row for row in state['mappings']}
+        # Inventory must not wait on unrelated diagnostics in the USB export.
+        # Those files may be unavailable during a mount transition.
+        mapping_path = self.private / 'mappings.json'
+        rows = bridge._read(mapping_path) if mapping_path.exists() else []
+        mappings = {row['local_book_id']: row for row in rows}
         saved_path = self.private / 'book-candidates.json'
         saved = bridge._read(saved_path) if saved_path.exists() else []
         saved = {row['candidate_id']: row for row in saved}
@@ -103,7 +104,8 @@ class DeviceApp:
                 pass
         books = []
         documents = self.mount / 'documents'
-        if documents.is_dir() and not self.mount.is_symlink() and not documents.is_symlink():
+        connected = documents.is_dir() and not self.mount.is_symlink() and not documents.is_symlink()
+        if connected:
             for folder, directories, files in os.walk(documents, followlinks=False):
                 base = Path(folder)
                 directories[:] = sorted(name for name in directories
@@ -123,12 +125,12 @@ class DeviceApp:
                     author = '、'.join(a[:200] for a in authors if isinstance(a, str))[:1024] if isinstance(authors, list) else ''
                     key = path.stem
                     books.append({'candidate_id': relative, 'title': title, 'author': author,
-                                  'local_book_id': key if key in parsed or key in mappings else None,
+                                  'local_book_id': key if key in mappings else None,
                                   'mapping': mappings.get(key),
                                   'saved': saved.get(relative)})
                     if len(books) >= 200:
-                        return {'books': books, 'connected': True, 'truncated': True}
-        return {'books': books, 'connected': bool(state['usb']['connected']), 'truncated': False}
+                        return {'books': books, 'connected': True, 'read_only': bool(os.statvfs(self.mount).f_flag & os.ST_RDONLY), 'truncated': True}
+        return {'books': books, 'connected': connected, 'read_only': connected and bool(os.statvfs(self.mount).f_flag & os.ST_RDONLY), 'truncated': False}
 
     def save_candidate(self, body):
         if body.get('confirmed') is not True:
@@ -163,8 +165,11 @@ class DeviceApp:
     def export_candidates(self, confirmed):
         if confirmed is not True:
             raise ValueError('请先确认将候选对应交给当前 Kindle。')
-        if not bridge.probe_usb(self.mount)['connected']:
+        probe = bridge.probe_usb(self.mount)
+        if not probe['connected']:
             raise ValueError('Kindle 未连接。')
+        if probe.get('read_only'):
+            raise ValueError('Kindle 当前只读，对应已保存在 Mac，恢复可写连接后才能导出。')
         status = bridge._read(self.mount/'.kindle-native-sync-export/status.json')
         if not isinstance(status.get('book_candidates'), dict):
             raise ValueError('请先安装 Preview 0.2.0 或更新设备包，并导出一次设备状态。')
@@ -227,28 +232,38 @@ class DeviceApp:
             if path=='/api/search':
                 keyword=body.get('keyword')
                 if not isinstance(keyword,str) or not 1<=len(keyword)<=100:raise ValueError('请输入书名或作者。')
+                source=body.get('source','all')
+                if source not in ('all','uploaded','store'):raise ValueError('请选择有效的书籍来源。')
                 catalog_auth = self.private / 'catalog-auth.json'
                 auth=load_auth(catalog_auth if catalog_auth.exists() else self.private/'device-auth.json')
-                result=Transport().request('GET','https://i.weread.qq.com/store/search',query={'keyword':keyword,'scope':10,'maxIdx':0,'count':20},credentials=auth)
+                result={} if source=='uploaded' else Transport().request('GET','https://i.weread.qq.com/store/search',query={'keyword':keyword,'scope':10,'maxIdx':0,'count':20},credentials=auth)
                 # Read-only server responses stay local; select only book identity metadata.
                 found={}
                 def walk(item, depth=0, shelf=False):
                     if depth>12:return
                     if isinstance(item,list):
-                        for child in item[:200]:walk(child,depth+1,shelf)
+                        # Transport already bounds the response to 8 MiB. A shelf
+                        # can contain more than 200 entries, including uploads.
+                        for child in item:walk(child,depth+1,shelf)
                     elif isinstance(item,dict):
                         if item.get('bookId') and isinstance(item.get('title'),str):
                             matches=keyword.casefold() in (item['title']+' '+str(item.get('author',''))).casefold()
                             if not shelf or matches:
                                 row={k:str(item[k]) for k in ('bookId','title','author','publisher','isbn') if isinstance(item.get(k),(str,int))}
+                                row['source']='uploaded' if row['bookId'].startswith('CB_') else ('shelf' if shelf else 'store')
                                 found[row['bookId']]=row
                         for child in item.values():
                             if isinstance(child,(dict,list)):walk(child,depth+1,shelf)
                 walk(result)
                 shelf_available=True
-                try:walk(Transport().request('GET','https://i.weread.qq.com/shelf/sync',credentials=auth).get('books',[]),shelf=True)
-                except BridgeError:shelf_available=False
-                return {'books':list(found.values())[:40],'shelf_available':shelf_available}
+                if source!='store':
+                    try:walk(Transport().request('GET','https://i.weread.qq.com/shelf/sync',credentials=auth).get('books',[]),shelf=True)
+                    except BridgeError:
+                        if source=='uploaded':raise
+                        shelf_available=False
+                books=[row for row in found.values() if source!='uploaded' or row['source']=='uploaded']
+                books.sort(key=lambda row: {'uploaded':0,'shelf':1,'store':2}[row['source']])
+                return {'books':books[:40],'shelf_available':shelf_available,'truncated':len(books)>40}
             if path=='/api/device/handoff':
                 if body.get('confirmed') is not True:raise ValueError('须明确确认交接。')
                 device_auth=load_auth(self.private/'device-auth.json')

@@ -70,6 +70,7 @@ def probe_usb(mount='/Volumes/Kindle'):
     answer={'connected':connected,'supported_profile':PROFILE,'root_probe':None,
             'jailbreak_performed':False,'installed_by_this_call':False}
     if not connected:return answer
+    answer['read_only']=bool(os.statvfs(mount).f_flag & os.ST_RDONLY)
     version=mount/'system/version.txt'
     if version.is_file() and not version.is_symlink():
         import re
@@ -190,6 +191,7 @@ def export_config(project_root, mount, *, credentials_path=None, mappings=None):
     root=Path(project_root).resolve();private=root/'.weread';mount=Path(mount)
     probe=probe_usb(mount)
     if not probe['connected']:raise ValueError('Kindle 未连接。')
+    if probe.get('read_only'):raise ValueError('Kindle 当前为只读连接，可以保存本机对应，恢复可写连接后才能导出。')
     if probe.get('firmware_supported') is False:raise ValueError('设备固件不匹配，拒绝导出配置。')
     fence_path=private/FENCE
     with _locked_ledger(private) as db:
