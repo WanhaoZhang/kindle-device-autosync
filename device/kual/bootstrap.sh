@@ -114,13 +114,27 @@ case "${1:-probe}" in
     mv "$OUT/preview-upgrade-result.json.partial" "$OUT/preview-upgrade-result.json";sync;;
  preview-recover)
     exec sh "$PACKAGE/install/preview-upgrade.sh" "$PACKAGE" recover;;
- setup-preview|resume-setup)
+ setup-fresh|setup-preview|resume-setup)
     # Explicit deployment action: no account request. Configuration must have
     # been staged by the Mac helper, and Wi-Fi remains controlled by the user.
     setup_stage=verify_installed
     trap finish_setup EXIT
     trap 'exit 129' HUP;trap 'exit 130' INT;trap 'exit 143' TERM
-    if [ "$1" = setup-preview ];then
+    if [ "$1" = setup-fresh ];then
+        setup_stage=fresh_install_preflight
+        case "$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null)" in
+            NA|DISABLED|UNAVAILABLE) ;;
+            *) echo 'Enable airplane mode before setup.' >&2;exit 1;;
+        esac
+        for path in "$ROOT/bin" "$ROOT/config.json" "$ROOT/auth.json";do
+            [ ! -e "$path" ] && [ ! -L "$path" ] || { echo 'Already installed; use the applicable existing-installation path.' >&2;exit 1; }
+        done
+        [ -d /mnt/us/.kindle-native-sync-inbox ] && [ ! -L /mnt/us/.kindle-native-sync-inbox ] || { echo 'Stage USB configuration first.' >&2;exit 1; }
+        sh "$0" probe
+        setup_stage=install_collection
+        sh "$PACKAGE/install/install.sh" "$PACKAGE"
+        setup_stage=verify_installed
+    elif [ "$1" = setup-preview ];then
         setup_stage=replace_preview
         sh "$0" preview-upgrade
     fi
@@ -159,5 +173,5 @@ case "${1:-probe}" in
     run_installed action-authorize-prepare.json operate --inbox /mnt/us/.kindle-native-sync-actions --action authorize-prepare;;
  confirm-enable)
     run_installed action-confirm-enable.json operate --inbox /mnt/us/.kindle-native-sync-actions --action confirm-enable;;
- *) echo 'Usage: bootstrap.sh probe|self-test|tls-self-test|install|preview-upgrade|preview-recover|setup-preview|resume-setup|online-self-test|authorize-trial|prepare|confirm|enable-experimental|disable-experimental|authorize-prepare|confirm-enable' >&2;exit 2;;
+ *) echo 'Usage: bootstrap.sh probe|self-test|tls-self-test|install|preview-upgrade|preview-recover|setup-fresh|setup-preview|resume-setup|verify-setup|online-self-test|authorize-trial|prepare|confirm|enable-experimental|disable-experimental|authorize-prepare|confirm-enable' >&2;exit 2;;
 esac

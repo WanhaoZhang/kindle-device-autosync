@@ -1,6 +1,10 @@
 {
   "items": [
     {
+      "name": "First install + import + protect + reboot",
+      "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh setup-fresh"
+    },
+    {
       "name": "Setup stopped preview + import + reboot",
       "action": "sh /mnt/us/extensions/kindle-native-sync/bootstrap.sh setup-preview"
     },

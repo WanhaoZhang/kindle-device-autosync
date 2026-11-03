@@ -22,6 +22,13 @@ class SetupFlow(unittest.TestCase):
         # Actual sha tool is required by installed-vs-candidate readback.
         self.tool('sha256sum','if [ "$1" = -c ];then exit 0;fi\nshasum -a 256 "$@"\n')
         (self.package/'SHA256SUMS').write_text('')
+        (self.package/'install/probe.sh').write_text('echo probe >> '+str(self.calls)+'\n')
+        (self.package/'install/install.sh').write_text(
+            'echo install >> '+str(self.calls)+'\n'
+            'mkdir -p '+str(self.root/'bin')+'\n'
+            'cp -p '+str(self.package/'bin')+'/* '+str(self.root/'bin')+'/\n'
+        )
+
         worker='''#!/bin/sh
 echo "$3" >> CALLS
 if [ -f FAILURE ] && [ "$(cat FAILURE)" = "$3" ];then exit 17;fi
@@ -42,6 +49,23 @@ printf '{"state":"completed","network_writes":false}\n'
     def run_action(self,action):return subprocess.run(['sh',str(self.script),action],env=self.env,capture_output=True,text=True,timeout=5)
 
     def steps(self):return self.calls.read_text().splitlines() if self.calls.exists() else []
+
+    def test_first_install_imports_and_protects_in_one_action(self):
+        shutil.rmtree(self.root/'bin')
+        self.tool('lipc-get-prop','case "$2" in userstoreIsAvailable) echo 1;; cmState) echo DISABLED;;esac\n')
+        r=self.run_action('setup-fresh')
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(self.steps(),['probe','install','self-test','import-config','guard','enable','reboot'])
+        self.assertTrue((self.out/'probe.json').exists())
+
+    def test_first_install_rejects_online_or_existing_devices(self):
+        r=self.run_action('setup-fresh')
+        self.assertNotEqual(r.returncode,0)
+        self.assertEqual(self.steps(),[])
+        self.tool('lipc-get-prop','case "$2" in userstoreIsAvailable) echo 1;; cmState) echo DISABLED;;esac\n')
+        r=self.run_action('setup-fresh')
+        self.assertNotEqual(r.returncode,0)
+        self.assertEqual(self.steps(),[])
 
     def test_setup_commits_preview_before_import_and_reboots_only_after_guard(self):
         r=self.run_action('setup-preview');self.assertEqual(r.returncode,0,r.stderr)

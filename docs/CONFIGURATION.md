@@ -2,6 +2,8 @@
 
 这里配置的是 [Kindle 设备端](https://github.com/WanhaoZhang/kindle-device-autosync)。Mac 助手仅处理扫码、对应关系、交接和诊断，不导入阅读日志或提交阅读时长。需要 USB 导入与人工上传的用户使用独立的 [网页版项目](https://github.com/WanhaoZhang/kindle-native-reading-sync)。
 
+首次安装可使用 [快速安装](QUICKSTART.md)，探针通过后在同一次 USB 连接上完成本页的扫码和配置导出，再由 KUAL 合并执行安装和导入。以下为单步说明。
+
 ## 1. 先验证设备
 
 按 [设备安装说明](../device/install/README.md) 完成适配当前 PW2 固件的 root 环境、自检及只采集安装。先保持飞行模式，完成一次原生阅读、关书、合盖/唤醒、USB 接回测试。在 KUAL 选择 `Export sanitized status` 后接回 Mac，助手的诊断内容才是最新导出快照；页面不能实时查询已经拔线的 Kindle。

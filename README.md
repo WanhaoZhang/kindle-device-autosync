@@ -2,7 +2,10 @@
 
 在 Kindle 上保留原生阅读器，通过小型 C 采集器记录阅读事件，再按需启动 Rust worker 解析每书、每日模型用时，并研究直接同步微信读书。
 
-**这是 Kindle 设备端项目，处于实验预览阶段，默认只采集。** 已在一台 Paperwhite 2 / 固件 5.12.2.1.1 上完成 root 环境及 ARM worker 的无网络文件/SQLite 自检；长期休眠、耗电和完整入账场景尚未验收。默认保持只采集；明确选择实验使用后，仍须在本机完成真实 TLS 检查和一笔精确到账的短试传，才可打开实验性自动同步。不能将编译、自检或用户接受轻微卡顿写成正式验收通过。
+**设备端实验预览，默认只采集。** 一台 Paperwhite 2 / 5.12.2.1.1 已验证原生采集、真实 TLS、同日短试传到账及后台提交。历史日期有成功回执但未入账的案例，性能与完整协议矩阵待验收。
+
+- [快速安装](docs/QUICKSTART.md) · 已有 KUAL 时把检查、安装和配置尽量合到同一轮，附预发布包。
+- [完整复现和排错记录](docs/PW2_REPRODUCTION.md) · 从原厂 PW2 开始，包含包版本、源码构建、实机观察和异常恢复。
 
 ## 与网页版的区别
 
@@ -20,7 +23,7 @@ Kindle 原生阅读 → C 增量采集并封存 → 明确关书后空闲至少 
                                       ↓
                         设备醒着、非 USB 导出时按需启动 worker
                                       ↓
-                      通过验收且已有网络时才允许上报并回查
+                      取得正式或实验授权且已有网络时才允许上报并回查
 ```
 
 程序不主动开启 Wi-Fi、不定时唤醒、不申请阻止休眠的锁。读书时不因长时间停留在一页而判断“空闲”；合盖时短小落盘，未完成工作留待自然唤醒。未知或没有准确匹配的书籍继续保留，不能按相似标题猜测版本。
@@ -30,7 +33,7 @@ Kindle 原生阅读 → C 增量采集并封存 → 明确关书后空闲至少 
 - 当前脚本仅允许 **PW2 / 型号前缀 B0D4 / 固件 5.12.2.1.1 / ARMv7**，其他设备会被拒绝。
 - 需要用户另行准备、核验的 root / jailbreak、Upstart、LIPC、KUAL 环境；本仓库不自动越狱或升级固件。
 - Mac 配置助手需要 Python **3.11+**。Rust **1.91.0** 和交叉工具链仅在构建设备程序时需要。
-- 尚无经过全部真机验收的稳定安装包。生成候选包时必须核对 ARM ELF、来源和 SHA256；不要将 Mac 可执行文件复制成 Kindle 程序。
+- [Releases](https://github.com/WanhaoZhang/kindle-device-autosync/releases) 提供带 SHA256 的 PW2 预发布包。自行构建时核对 ARM ELF、来源和 SHA256。
 
 ## 启动 Mac 配置助手
 
@@ -63,7 +66,7 @@ rustup target add armv7-unknown-linux-musleabihf --toolchain 1.91.0
 
 工具链变量、Zig 0.13.0 实验性替代路径、包校验与完整安装步骤见 [设备安装说明](device/install/README.md)。`experimental-static-musl` 仅代表另一种 ARM 候选构建，不能宣称通过 NiLuJe 工具链兼容认证。
 
-候选包放入 Kindle USB 根目录的 `kindle-native-sync-package/`，其 `kual/` 内容放入 `extensions/kindle-native-sync/`。安全弹出并拔线后，从 KUAL 的 **Native Reading Sync** 菜单依次进行：
+从源码做逐项验收时，候选包放入 Kindle USB 根目录的 `kindle-native-sync-package/`，其 `kual/` 内容放入 `extensions/kindle-native-sync/`。安全弹出并拔线后，从 KUAL 的 **Native Reading Sync** 菜单依次进行：
 
 1. `Export root compatibility probe`，接回核对型号、固件、空间及 root 状态。
 2. `Run local candidate self-test (no network)`，先验证程序实际能运行。

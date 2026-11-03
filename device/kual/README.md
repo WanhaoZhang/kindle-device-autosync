@@ -16,6 +16,8 @@ The pinned `5423150` maintenance action is no longer in the default menu. Its op
 
 The current default menu provides:
 
+- **First install + import + protect + reboot**: for a fresh installation with USB config staged, in airplane mode. It groups the compatibility probe, collection-only install, installed filesystem self-test, import, OTA guard, collection enable and reboot. See the [quickstart](../../docs/QUICKSTART.md) for the full sequence and how to stage trial requests.
+
 - **Setup stopped preview + import + reboot**: a verified low-space replacement of the disabled/unconfigured preview, local self-test, import, OTA protection, collection startup, then an explicit reboot. Keep airplane mode until the protection has been verified after that reboot.
 - **Resume imported setup + protect + reboot**: resumes after an import/guard failure; it does not roll back or erase already imported credentials or private ledger.
 - **Check protected reboot + export status**: after setup restarts the device, this checks updater backup hashes, changed boot ID and actual root read-only state, then exports ordinary status. It does not require Wi-Fi.
