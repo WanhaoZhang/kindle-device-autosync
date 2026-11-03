@@ -77,4 +77,12 @@ root=/var/local/kindle-native-sync
 
 原实验中的 SETUP v2/v3、重复读短样本、重复制包、导出私有审计、分段权限修复、先提交再接纳旧回执，都是定位旧构建故障时用到的步骤。新安装按快速路线执行即可。日常维护使用 KUAL 的停用、状态导出与卸载；卸载保留原账本。恢复 OTA 原件需按[防护维护说明](../device/ota/README.md)单独执行。
 
+## 6. 已启用预览版的队列更新
+
+队列更新仅承接已有精确到账试传和已启用授权的 2bd766d 实机预览。它验证固定前代二进制、原配置、原试传账本与当前 TLS，在私有目录原子替换 worker。它保留原试传和未知结果，不把未完成的验收改成通过。一次执行脚本随后走普通 `sync` 入口，并导出结果；后续仍由原设备服务触发。
+
+此维护入口位于 `device/kual/resume-isolated-autosync.sh`。维护者将新 ARM worker 和单文件 SHA256 清单放入 USB 的 `.kindle-native-sync-queue-update/`，并将脚本加入当前 KUAL 菜单。前提是旧安装未被停用、OTA 防护已核验、USB 安全弹出并在设备端联网。核对 `queue-update-result.json`、`queue-update-sync.json`、`status.json` 和原 `sync-receipts.jsonl`。新安装用[快速安装](QUICKSTART.md)，无需此维护入口。
+
+有明确回执、原计划哈希与当前账号绑定都可核对的旧批次，会保留为待核验。新记录必须同时与其书籍和日期独立才可提交，因为后续到账可能影响单书累计和账号日累计。同书或同日继续排队；缺少明确回执的提交仍使全队列停止。合成回归验证独立批次只发送一次，并验证同日及同一微信书籍的别名被拦截。
+
 普通状态导出也可能包含书名和来源键，公开 Issue 仅贴手工筛选后的字段。私有诊断包含原始记录，留在本机。开发者可从源码运行 `python3 -m unittest discover -v`、`make -C device/collector test`、`cargo +1.91.0 test --locked --manifest-path device/worker/Cargo.toml`，离线复现故障边界。

@@ -882,11 +882,63 @@ fn save_readonly_recheck_hint(root: &Path) -> Result<()> {
     Ok(())
 }
 
+// A late credit can affect either the target book lifetime total or the
+// account-wide date total. Only acknowledged writes with intact ledger
+// ownership can be isolated along both dimensions.
+type UnresolvedScopes = Option<Vec<(String, String, String)>>;
+
+fn unresolved_scopes(store: &Store, c: &Config) -> Result<UnresolvedScopes> {
+    let mut stmt = store.db.prepare(
+        "SELECT a.id,a.state,a.body,p.state,p.body FROM attempts a LEFT JOIN plans p ON p.id=a.id WHERE a.state IN ('dispatching','unknown','needs_review','failed') ORDER BY a.id",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut scopes = Vec::new();
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? != "needs_review"
+            || row.get::<_, Option<String>>(3)?.as_deref() != Some("needs_review")
+        {
+            return Ok(None);
+        }
+        let id: String = row.get(0)?;
+        let receipt: Value = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        let mut plan: Value = serde_json::from_str(&row.get::<_, String>(4)?)?;
+        let plan_id = plan
+            .as_object_mut()
+            .context("invalid ledger plan")?
+            .remove("plan_id");
+        let (Some(book), Some(day)) = (plan["weread_book_id"].as_str(), plan["day"].as_str())
+        else {
+            return Ok(None);
+        };
+        if receipt["state"] != "needs_review"
+            || receipt["acknowledged"] != true
+            || receipt["plan_id"] != id
+            || plan_id != Some(json!(id))
+            || sha(plan.to_string()) != id
+            || plan["account_hash"] != c.account_hash()
+            || plan["binding_sha256"] != c.binding()?
+            || book.is_empty()
+            || chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_err()
+        {
+            return Ok(None);
+        }
+        scopes.push((id, book.into(), day.into()));
+    }
+    Ok(Some(scopes))
+}
+
 pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64) -> Result<Value> {
     let rt = gate(&store.root, false, now())?;
     let c = Config::load(&store.root)?;
     store.bind(&c)?;
     let effective_cutoff = c.bootstrap_cutoff_unix.max(rt.bootstrap_unix);
+    let Some(scopes) = unresolved_scopes(store, &c)? else {
+        return Ok(json!({"state":"empty_or_blocked","network_write":false}));
+    };
+    if trial && !scopes.is_empty() {
+        return Ok(json!({"state":"empty_or_blocked","network_write":false}));
+    }
+
     if trial {
         ensure!(
             (1..=60).contains(&max_seconds) && book.is_some(),
@@ -917,7 +969,13 @@ pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64)
         if book.is_some_and(|b| b != local) {
             continue;
         }
-        if c.mappings.iter().all(|m| m.local_book_id != local) {
+        let Some(mapping) = c.mappings.iter().find(|m| m.local_book_id == local) else {
+            continue;
+        };
+        if scopes
+            .iter()
+            .any(|(_, book, day)| book == &mapping.weread_book_id || s["day"] == *day)
+        {
             continue;
         }
         let uncertain:i64=store.db.query_row("SELECT count(*) FROM sessions WHERE book=? AND state IN ('dispatching','unknown','needs_review','failed','blocked_overlap')",[local],|r|r.get(0))?;
@@ -1039,11 +1097,6 @@ pub fn commit_verified<T: network::Transport>(
     store.bind(&c)?;
     let mut a = Auth::load(&store.root, &c)?;
     gate(&store.root, true, now())?;
-    let unresolved:i64=store.db.query_row("SELECT count(*) FROM attempts WHERE state IN ('dispatching','unknown','needs_review','failed')",[],|r|r.get(0))?;
-    ensure!(
-        unresolved == 0,
-        "unresolved write blocks new account submissions"
-    );
     ensure!(
         experimental::write_authorized(&store.root, &c, trial),
         "acceptance gates disabled"
@@ -1058,6 +1111,15 @@ pub fn commit_verified<T: network::Transport>(
     let plan: Value = serde_json::from_str(&body)?;
     verify_plan(store, &c, &plan, trial)?;
     let bid = plan["weread_book_id"].as_str().context("missing target")?;
+    let scopes =
+        unresolved_scopes(store, &c)?.context("unresolved write blocks new account submissions")?;
+    ensure!(
+        !(trial && !scopes.is_empty())
+            && !scopes
+                .iter()
+                .any(|(_, book, day)| book == bid || plan["day"] == *day),
+        "unresolved write overlaps the planned target book or date"
+    );
     let mut refreshed = false;
     let baseline = network::preflight(
         transport,
@@ -1237,8 +1299,8 @@ pub fn commit<T: network::Transport>(
 }
 
 /// Drain older book/day groups while the actual reader remains idle and the
-/// existing network stays connected. Each plan owns exactly one POST; uncertain
-/// results stop the entire drain and are never automatically replayed.
+/// existing network stays connected. Uncertain writes are never replayed.
+/// An acknowledged write blocks new writes to its target book or date.
 pub fn drain<T: network::Transport>(store: &Store, transport: &mut T) -> Result<Value> {
     drain_loop(store, transport, true)
 }
@@ -1249,6 +1311,7 @@ fn drain_loop<T: network::Transport>(
 ) -> Result<Value> {
     let mut batches = 0u64;
     let mut seconds = 0i64;
+    let mut rechecked = std::collections::HashSet::new();
     loop {
         if check_cancel().is_err() {
             return Ok(
@@ -1269,45 +1332,23 @@ fn drain_loop<T: network::Transport>(
                 json!({"state":"paused","reason":"device_not_idle_awake_connected","confirmed_batches":batches,"confirmed_seconds":seconds}),
             );
         }
-        // Acknowledged writes may become visible after the original worker
-        // exits. Recheck them using GET only before considering any new POST.
-        // Unknown/unacknowledged ownership stops everything without a request.
-        let unresolved = {
-            let mut stmt = store.db.prepare(
-                "SELECT id,state,body FROM attempts WHERE state IN ('dispatching','unknown','needs_review','failed') ORDER BY id",
-            )?;
-            stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        if unresolved.iter().any(|(_, state, body)| {
-            state != "needs_review"
-                || serde_json::from_str::<Value>(body).map_or(true, |v| v["acknowledged"] != true)
-        }) {
+        let Some(scopes) = unresolved_scopes(store, &c)? else {
             return Ok(
                 json!({"state":"needs_review","reason":"unresolved_write","confirmed_batches":batches,"confirmed_seconds":seconds}),
             );
+        };
+        for (id, _, _) in scopes {
+            if rechecked.insert(id.clone()) {
+                reconcile(store, &id, transport)?;
+            }
         }
-        for (id, _, _) in unresolved {
-            if reconcile(store, &id, transport)?["state"] != "confirmed" {
+        let p = prepare(store, None, false, 86400)?;
+        let Some(id) = p["plan"]["plan_id"].as_str() else {
+            if unresolved_scopes(store, &c)?.is_some_and(|v| !v.is_empty()) {
                 return Ok(
                     json!({"state":"needs_review","reason":"acknowledged_write_not_yet_verified","confirmed_batches":batches,"confirmed_seconds":seconds}),
                 );
             }
-        }
-        let unresolved:i64=store.db.query_row("SELECT count(*) FROM attempts WHERE state IN ('dispatching','unknown','needs_review','failed')",[],|r|r.get(0))?;
-        if unresolved > 0 {
-            return Ok(
-                json!({"state":"needs_review","reason":"unresolved_write","confirmed_batches":batches,"confirmed_seconds":seconds}),
-            );
-        }
-        let p = prepare(store, None, false, 86400)?;
-        let Some(id) = p["plan"]["plan_id"].as_str() else {
             return Ok(
                 json!({"state":"drained_or_blocked","confirmed_batches":batches,"confirmed_seconds":seconds,"remaining":p}),
             );
@@ -2261,71 +2302,74 @@ mod tests {
             1
         );
     }
-    #[test]
-    fn automatic_drain_uploads_multiple_books_and_days_without_resending() {
-        #[derive(Default)]
-        struct Multi {
-            books: std::collections::BTreeMap<String, i64>,
-            days: std::collections::BTreeMap<i64, i64>,
-            posts: usize,
-        }
-        impl Transport for Multi {
-            fn request(
-                &mut self,
-                method: &str,
-                path: &str,
-                query: &[(&str, String)],
-                body: Option<&Value>,
-                _: &Auth,
-            ) -> std::result::Result<Value, NetError> {
-                match path {
-                    "/book/getProgress" => {
-                        let bid = &query.iter().find(|(k, _)| *k == "bookId").unwrap().1;
-                        Ok(
-                            json!({"bookId":bid,"timestamp":now(),"book":{"readingTime":100+self.books.get(bid).copied().unwrap_or(0),"progress":10,"chapterUid":2,"chapterOffset":7}}),
-                        )
-                    }
-                    "/config" => Ok(json!({"token":"synthetic"})),
-                    "/feature" => Ok(json!({})),
-                    "/readdata/detail" => {
-                        let at: i64 = query
-                            .iter()
-                            .find(|(k, _)| *k == "baseTime")
-                            .unwrap()
-                            .1
-                            .parse()
-                            .unwrap();
-                        let local = zone().timestamp_opt(at, 0).unwrap();
-                        let midnight = at - local.time().num_seconds_from_midnight() as i64;
-                        let base = midnight - local.weekday().num_days_from_monday() as i64 * 86400;
-                        let days: serde_json::Map<String, Value> = self
-                            .days
-                            .iter()
-                            .filter(|(k, _)| **k >= base && **k < base + 604800)
-                            .map(|(k, v)| (k.to_string(), json!(v)))
-                            .collect();
-                        Ok(json!({"baseTime":base,"readTimes":days}))
-                    }
-                    "/book/batchUploadProgress" if method == "POST" => {
-                        self.posts += 1;
-                        let b = &body.unwrap()["books"][0];
-                        *self
-                            .books
-                            .entry(b["bookId"].as_str().unwrap().into())
-                            .or_default() += b["readingTime"].as_i64().unwrap();
-                        for h in b["hours"].as_array().unwrap() {
-                            let at = h["startOfHour"].as_i64().unwrap();
-                            let day = (at + 28800).div_euclid(86400) * 86400 - 28800;
-                            *self.days.entry(day).or_default() +=
-                                h["readingTime"].as_i64().unwrap();
-                        }
-                        Ok(json!({"succ":1}))
-                    }
-                    _ => Err(NetError::Invalid),
+    #[derive(Default)]
+    struct Multi {
+        books: std::collections::BTreeMap<String, i64>,
+        days: std::collections::BTreeMap<i64, i64>,
+        posts: usize,
+        acknowledge_first_without_credit: bool,
+    }
+    impl Transport for Multi {
+        fn request(
+            &mut self,
+            method: &str,
+            path: &str,
+            query: &[(&str, String)],
+            body: Option<&Value>,
+            _: &Auth,
+        ) -> std::result::Result<Value, NetError> {
+            use chrono::Timelike;
+            match path {
+                "/book/getProgress" => {
+                    let bid = &query.iter().find(|(k, _)| *k == "bookId").unwrap().1;
+                    Ok(
+                        json!({"bookId":bid,"timestamp":now(),"book":{"readingTime":100+self.books.get(bid).copied().unwrap_or(0),"progress":10,"chapterUid":2,"chapterOffset":7}}),
+                    )
                 }
+                "/config" => Ok(json!({"token":"synthetic"})),
+                "/feature" => Ok(json!({})),
+                "/readdata/detail" => {
+                    let at: i64 = query
+                        .iter()
+                        .find(|(k, _)| *k == "baseTime")
+                        .unwrap()
+                        .1
+                        .parse()
+                        .unwrap();
+                    let local = zone().timestamp_opt(at, 0).unwrap();
+                    let midnight = at - local.time().num_seconds_from_midnight() as i64;
+                    let base = midnight - local.weekday().num_days_from_monday() as i64 * 86400;
+                    let days: serde_json::Map<String, Value> = self
+                        .days
+                        .iter()
+                        .filter(|(k, _)| **k >= base && **k < base + 604800)
+                        .map(|(k, v)| (k.to_string(), json!(v)))
+                        .collect();
+                    Ok(json!({"baseTime":base,"readTimes":days}))
+                }
+                "/book/batchUploadProgress" if method == "POST" => {
+                    self.posts += 1;
+                    if self.posts == 1 && self.acknowledge_first_without_credit {
+                        return Ok(json!({"succ":1}));
+                    }
+                    let b = &body.unwrap()["books"][0];
+                    *self
+                        .books
+                        .entry(b["bookId"].as_str().unwrap().into())
+                        .or_default() += b["readingTime"].as_i64().unwrap();
+                    for h in b["hours"].as_array().unwrap() {
+                        let at = h["startOfHour"].as_i64().unwrap();
+                        let day = (at + 28800).div_euclid(86400) * 86400 - 28800;
+                        *self.days.entry(day).or_default() += h["readingTime"].as_i64().unwrap();
+                    }
+                    Ok(json!({"succ":1}))
+                }
+                _ => Err(NetError::Invalid),
             }
         }
-        use chrono::Timelike;
+    }
+    #[test]
+    fn automatic_drain_uploads_multiple_books_and_days_without_resending() {
         let (_t, s, mut c) = fixture();
         c.validation.protocol_validation = true;
         c.mappings.push(Mapping {
@@ -2362,6 +2406,80 @@ mod tests {
         assert_eq!(result["confirmed_batches"], 2);
         assert_eq!(result["confirmed_seconds"], 20);
         assert_eq!(transport.posts, 2);
+        let again = drain_loop(&s, &mut transport, false).unwrap();
+        assert_eq!(again["confirmed_batches"], 0);
+        assert_eq!(transport.posts, 2);
+    }
+    #[test]
+    fn acknowledged_batch_blocks_its_book_and_date_but_allows_independent_upload() {
+        let (_t, s, mut c) = fixture();
+        c.validation.protocol_validation = true;
+        for (key, target) in [("B", "second-book"), ("alias", "example-book")] {
+            c.mappings.push(Mapping {
+                local_book_id: key.into(),
+                weread_book_id: target.into(),
+                title: "Synthetic title".into(),
+            });
+        }
+        c.validation.binding_sha256 = c.binding().unwrap();
+        atomic_json(
+            &s.root.join("config.json"),
+            &serde_json::to_value(c).unwrap(),
+        )
+        .unwrap();
+        let id = plan(&s);
+        let mut transport = Multi {
+            acknowledge_first_without_credit: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_verified(&s, &id, true, &mut transport).unwrap()["state"],
+            "needs_review"
+        );
+        let body: String =
+            s.db.query_row("SELECT body FROM sessions WHERE id='session-a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        for (id, book, day) in [
+            ("same-day", "B", "2026-11-01"),
+            ("same-target", "alias", "2026-11-02"),
+            ("independent", "B", "2026-11-02"),
+        ] {
+            let mut session: Value = serde_json::from_str(&body).unwrap();
+            let start = format!("{day}T09:00:00");
+            session["id"] = json!(id);
+            session["local_book_id"] = json!(book);
+            session["day"] = json!(day);
+            session["started_at"] = json!(start);
+            session["ended_at"] = json!(format!("{day}T09:00:13"));
+            session["hours"][0]["startOfHour"] = json!(epoch(&start).unwrap());
+            s.db.execute(
+                "INSERT INTO sessions VALUES (?1,?2,?3,13000,26000,101,'pending',?4)",
+                params![id, book, day, session.to_string()],
+            )
+            .unwrap();
+        }
+        let next = prepare(&s, None, false, 86400).unwrap();
+        assert_eq!(next["plan"]["sessions"][0]["id"], "independent");
+        assert_eq!(next["plan"]["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            prepare(&s, Some("B"), true, 60).unwrap()["state"],
+            "empty_or_blocked"
+        );
+        assert_eq!(
+            unresolved_scopes(&s, &Config::load(&s.root).unwrap())
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        let result = drain_loop(&s, &mut transport, false).unwrap();
+        assert_eq!(result["confirmed_batches"], 1);
+        assert_eq!(result["confirmed_seconds"], 13);
+        assert_eq!(transport.posts, 2);
+        assert_eq!(transport.books.get("second-book"), Some(&13));
+        assert_eq!(transport.books.get("example-book"), None);
         let again = drain_loop(&s, &mut transport, false).unwrap();
         assert_eq!(again["confirmed_batches"], 0);
         assert_eq!(transport.posts, 2);

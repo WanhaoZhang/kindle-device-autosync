@@ -312,12 +312,71 @@ fn verified_trial(store: &Store, c: &Config, id: &str, authorization: &Value) ->
         ),
         "trial receipt increments/position do not match"
     );
-    let unresolved:i64=store.db.query_row("SELECT count(*) FROM attempts WHERE state IN ('dispatching','unknown','needs_review','failed')",[],|r|r.get(0))?;
+    Ok(plan)
+}
+
+fn require_clean_activation(store: &Store) -> Result<()> {
+    let unresolved: i64 = store.db.query_row(
+        "SELECT count(*) FROM attempts WHERE state IN ('dispatching','unknown','needs_review','failed')",
+        [], |r| r.get(0),
+    )?;
     ensure!(
         unresolved == 0,
         "unresolved writes prevent enabling automatic sync"
     );
-    Ok(plan)
+    Ok(())
+}
+
+/// Carry forward an already enabled installation across this queue-only upgrade.
+/// This does not create an authorization for a previously disabled installation.
+pub fn resume_isolated_autosync(store: &Store) -> Result<Value> {
+    const PRIOR_WORKER: &str = "f327c8bfc6605093a413aff88462c2056f36c54f74cb3e6e3669268803d22350";
+    let c = Config::load(&store.root)?;
+    device_gate(&store.root, &c)?;
+    store.bind(&c)?;
+    Auth::load(&store.root, &c)?;
+    let probe = actual_device();
+    let current = check_tls(&store.root, &c, &probe)?;
+    let mut prior = private_json(&store.root.join(AUTHORIZATION))?;
+    if prior["worker_sha256"] == current["worker_sha256"] {
+        checked_authorization(&store.root, &c, &probe, true)?;
+        ensure!(
+            prior["queue_upgrade"]["previous_worker_sha256"] == PRIOR_WORKER,
+            "existing authorization is not from this upgrade"
+        );
+        return Ok(json!({"state":"isolated_autosync_resumed"}));
+    }
+    unchanged_legacy_wire()?;
+    for key in ["schema_version", "config_binding_sha256", "kernel_release"] {
+        ensure!(
+            prior[key] == current[key],
+            "installed authorization belongs to another device configuration"
+        );
+    }
+    ensure!(
+        prior["worker_sha256"] == PRIOR_WORKER
+            && prior["mode"] == "auto"
+            && prior["accept_unverified_performance"] == true
+            && prior["accept_unverified_protocol"] == true
+            && prior["formal_device_validation_claimed"] == false
+            && prior["formal_protocol_validation_claimed"] == false,
+        "a previously enabled preview installation is required"
+    );
+    let id = prior["confirmed_trial_plan_id"]
+        .as_str()
+        .context("missing confirmed trial")?;
+    let adoption = &prior["trial_adoption"];
+    ensure!(
+        adoption["plan_id"] == id && adoption["current_worker_sha256"] == PRIOR_WORKER,
+        "prior verified trial evidence does not match the installed worker"
+    );
+    let original = &adoption["prior_authorization"];
+    legacy_authorization(&c, &probe, original)?;
+    verified_trial(store, &c, id, original)?;
+    prior["worker_sha256"] = current["worker_sha256"].clone();
+    prior["queue_upgrade"] = json!({"previous_worker_sha256":PRIOR_WORKER,"enabled_unix":now()});
+    atomic_json(&store.root.join(AUTHORIZATION), &prior)?;
+    Ok(json!({"state":"isolated_autosync_resumed"}))
 }
 
 fn adopt_authorization(
@@ -328,6 +387,7 @@ fn adopt_authorization(
     probe: &Value,
 ) -> Result<Value> {
     legacy_authorization(c, probe, previous)?;
+    require_clean_activation(store)?;
     let plan = verified_trial(store, c, id, previous)?;
     for session in plan["sessions"].as_array().unwrap() {
         parsing::verify_manifest(&store.root, session)?;
@@ -458,6 +518,7 @@ fn enable_with_probe(
     );
     Auth::load(&store.root, c)?;
     let mut proof = checked_authorization(&store.root, c, probe, false)?;
+    require_clean_activation(store)?;
     verified_trial(store, c, id, &proof)?;
     proof["mode"] = json!("auto");
     proof["accept_unverified_protocol"] = json!(true);

@@ -35,6 +35,7 @@ fn run() -> Result<serde_json::Value> {
                 "experimental-authorize-trial",
                 "experimental-enable",
                 "experimental-disable",
+                "resume-isolated-autosync",
             ]
             .contains(&s.as_str())
         })
@@ -49,6 +50,7 @@ fn run() -> Result<serde_json::Value> {
     let store = Store::open(&root)?;
     match command {
         "status" => store.status(),
+        "resume-isolated-autosync" => experimental::resume_isolated_autosync(&store),
         "operate" => {
             experimental::operate(&store, Path::new(&value("--inbox")?), &value("--action")?)
         }
