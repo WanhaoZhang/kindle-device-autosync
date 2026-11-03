@@ -82,6 +82,84 @@ class DeviceApp:
         out['mappings']=bridge._read(mapping) if mapping.exists() else []
         return out
 
+    def book_candidates(self):
+        """Inventory metadata only. Filename candidates remain distinct from parsed IDs."""
+        state = self.state()
+        parsed = {row['local_book_id']: row for row in
+                  (state.get('device_status') or {}).get('books', [])}
+        mappings = {row['local_book_id']: row for row in state['mappings']}
+        saved_path = self.private / 'book-candidates.json'
+        saved = bridge._read(saved_path) if saved_path.exists() else []
+        saved = {row['candidate_id']: row for row in saved}
+        metadata = {}
+        meta_path = self.mount / 'metadata.calibre'
+        if meta_path.is_file() and not meta_path.is_symlink() and meta_path.stat().st_size <= 8 * 1024 * 1024:
+            try:
+                records = json.loads(meta_path.read_bytes())
+                for row in records if isinstance(records, list) else []:
+                    if isinstance(row, dict) and isinstance(row.get('lpath'), str):
+                        metadata[row['lpath']] = row
+            except (OSError, ValueError):
+                pass
+        books = []
+        documents = self.mount / 'documents'
+        if documents.is_dir() and not self.mount.is_symlink() and not documents.is_symlink():
+            for folder, directories, files in os.walk(documents, followlinks=False):
+                base = Path(folder)
+                directories[:] = sorted(name for name in directories
+                    if not name.startswith('.') and not name.endswith('.sdr')
+                    and not (base / name).is_symlink()
+                    and len((base / name).relative_to(documents).parts) < 12)
+                for name in sorted(files):
+                    path = base / name
+                    if name.startswith('.') or path.is_symlink() or path.suffix.lower() not in {
+                            '.azw', '.azw3', '.mobi', '.epub', '.pdf', '.kfx'}:
+                        continue
+                    relative = path.relative_to(self.mount).as_posix()
+                    row = metadata.get(relative, {})
+                    title = row.get('title')
+                    title = title[:1024] if isinstance(title, str) and title else path.stem
+                    authors = row.get('authors', [])
+                    author = '、'.join(a[:200] for a in authors if isinstance(a, str))[:1024] if isinstance(authors, list) else ''
+                    key = path.stem
+                    books.append({'candidate_id': relative, 'title': title, 'author': author,
+                                  'local_book_id': key if key in parsed or key in mappings else None,
+                                  'mapping': mappings.get(key),
+                                  'saved': saved.get(relative)})
+                    if len(books) >= 200:
+                        return {'books': books, 'connected': True, 'truncated': True}
+        return {'books': books, 'connected': bool(state['usb']['connected']), 'truncated': False}
+
+    def save_candidate(self, body):
+        if body.get('confirmed') is not True:
+            raise ValueError('请先核对作者和版本，再确认对应。')
+        candidate_id = body.get('candidate_id')
+        candidate = next((row for row in self.book_candidates()['books']
+                          if row['candidate_id'] == candidate_id), None)
+        if candidate is None:
+            raise ValueError('候选书已不在当前 Kindle，请刷新后重选。')
+        target = body.get('target')
+        if not isinstance(target, dict):
+            raise ValueError('请选择微信读书版本。')
+        clean = {}
+        for key in ('bookId', 'title', 'author', 'publisher', 'isbn'):
+            value = target.get(key, '')
+            if not isinstance(value, str) or len(value) > 1024 or '\x00' in value:
+                raise ValueError('目标书籍信息无效。')
+            clean[key] = value
+        if not clean['bookId'] or not clean['title']:
+            raise ValueError('目标书籍 ID 和书名不能为空。')
+        path = self.private / 'book-candidates.json'
+        saved = bridge._read(path) if path.exists() else []
+        rows = [row for row in saved if row['candidate_id'] != candidate_id]
+        if len(rows) >= 200:
+            raise ValueError('候选对应已达 200 项，请先整理已有候选。')
+        rows.append({'candidate_id': candidate_id, 'title': candidate['title'],
+                     'author': candidate['author'], 'target': clean})
+        bridge._write(path, rows)
+        return {'state': 'candidate_saved', 'candidate': rows[-1],
+                'device_updated': False, 'awaiting_native_identity': candidate['local_book_id'] is None}
+
     def start_login(self):
         if self.login_process and self.login_process.poll() is None:return self.login_status()
         if (self.private/'device-auth.json').exists():raise ValueError('已有 Kindle 专用凭据。不会在此隐藏切换设备身份；重新授权请先按维护说明核对账本。')
@@ -110,6 +188,7 @@ class DeviceApp:
 
     def dispatch(self, path, body):
         with self.lock:
+            if path=='/api/books/save':return self.save_candidate(body)
             if path=='/api/source':return self.select_source(body)
             if path=='/api/device/login':return self.start_login()
             if path=='/api/mappings/save':return self.mappings(body.get('mappings'))
@@ -120,7 +199,8 @@ class DeviceApp:
             if path=='/api/search':
                 keyword=body.get('keyword')
                 if not isinstance(keyword,str) or not 1<=len(keyword)<=100:raise ValueError('请输入书名或作者。')
-                auth=load_auth(self.private/'device-auth.json')
+                catalog_auth = self.private / 'catalog-auth.json'
+                auth=load_auth(catalog_auth if catalog_auth.exists() else self.private/'device-auth.json')
                 result=Transport().request('GET','https://i.weread.qq.com/store/search',query={'keyword':keyword,'scope':10,'maxIdx':0,'count':20},credentials=auth)
                 # Read-only server responses stay local; select only book identity metadata.
                 found={}
@@ -182,6 +262,9 @@ def make_handler(app):
             if path=='/api/bootstrap':return self.reply(200,{'csrf_token':app.csrf})
             if path in ('/','/device'):return self.reply(200,(app.base/'config-web/index.html').read_bytes(),'text/html; charset=utf-8')
             if path=='/login-qr.png' and app.qr_path and app.qr_path.is_file():return self.reply(200,app.qr_path.read_bytes(),'image/png')
+            if path=='/api/books':
+                try:return self.reply(200,{'ok':True,'data':app.book_candidates()})
+                except Exception:return self.reply(500,{'ok':False,'error':'候选书读取失败，请核对 Kindle 连接。'})
             if path=='/api/device':
                 try:return self.reply(200,{'ok':True,'data':app.state()})
                 except Exception:return self.reply(500,{'ok':False,'error':'本地状态不可读取，请保留文件。'})

@@ -114,6 +114,44 @@ class DeviceAppTests(unittest.TestCase):
             with self.assertRaises(ValueError):self.app.dispatch('/api/mappings/save',{'mappings':rows})
         self.assertFalse((self.base/'.weread/mappings.json').exists())
 
+    def test_candidate_inventory_uses_metadata_and_keeps_unparsed_files_unbound(self):
+        docs = self.mount/'documents'
+        book = docs/'Author'/'Exact File.mobi'
+        book.parent.mkdir()
+        book.write_bytes(b'book contents are not read')
+        self.write(self.mount/'metadata.calibre', [
+            {'lpath':'documents/Author/Exact File.mobi','title':'Candidate Title','authors':['Author']}
+        ])
+        (docs/'link.mobi').symlink_to(book)
+        hidden = docs/'secret.sdr'
+        hidden.mkdir()
+        (hidden/'not-a-book.mobi').write_bytes(b'private sidecar')
+        result = self.app.book_candidates()
+        self.assertEqual(len(result['books']), 1)
+        candidate = result['books'][0]
+        self.assertEqual(candidate['title'], 'Candidate Title')
+        self.assertIsNone(candidate['local_book_id'])
+        self.assertEqual(candidate['candidate_id'], 'documents/Author/Exact File.mobi')
+
+    def test_candidate_save_requires_confirmation_and_preserves_active_mappings(self):
+        (self.mount/'documents'/'Candidate.mobi').write_bytes(b'not parsed')
+        original = [{'local_book_id':'A','weread_book_id':'123','title':'Existing'}]
+        self.app.mappings(original)
+        request = {'candidate_id':'documents/Candidate.mobi',
+                   'target':{'bookId':'456','title':'Candidate Target','author':'Author'}}
+        with self.assertRaises(ValueError):
+            self.app.dispatch('/api/books/save', request)
+        result = self.app.dispatch('/api/books/save', {**request,'confirmed':True})
+        self.assertTrue(result['awaiting_native_identity'])
+        self.assertFalse(result['device_updated'])
+        self.assertEqual(self.app.state()['mappings'], original)
+        self.app.dispatch('/api/books/save', {**request,'confirmed':True})
+        saved = json.loads((self.base/'.weread/book-candidates.json').read_text())
+        self.assertEqual(len(saved), 1)
+        (self.mount/'documents'/'Candidate.mobi').unlink()
+        with self.assertRaises(ValueError):
+            self.app.dispatch('/api/books/save', {**request,'confirmed':True})
+
     def test_http_guards_and_no_import_or_time_upload_routes(self):
         server=device_app.ThreadingHTTPServer(('127.0.0.1',0),device_app.make_handler(self.app));port=server.server_address[1]
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()

@@ -1,8 +1,21 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kindle 自动同步 · 首次配置</title>
-<style>body{max-width:920px;margin:38px auto;padding:0 22px;background:#f6f5ef;color:#243d32;font:15px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}h1{font-size:28px}h2{font-size:21px}section{padding:22px 26px;border:1px solid #dbe1d6;border-radius:12px;background:#fffefa;margin:20px 0}button{font:inherit;border-radius:7px;border:1px solid #b7cbbd;padding:9px 16px;background:#285b45;color:#fff;cursor:pointer;margin:4px 10px 4px 0}button:disabled{opacity:.4;cursor:default}a{color:#285b45}.note{background:#f7f0db;padding:14px;border-radius:7px}.muted{color:#68786d}.error{color:#9b4940}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}img{max-width:240px}label{display:block;margin:12px 0}input[type=text],textarea{box-sizing:border-box;width:100%;font:inherit;border:1px solid #b7cbbd;border-radius:5px;padding:9px}textarea{min-height:200px;font-family:monospace}code{overflow-wrap:anywhere}</style></head><body>
-<h1>Kindle 自动同步 · 首次配置</h1><p class="muted">这是 Kindle 端项目的配置助手。它提供专用扫码、旧实例交接、准确书籍对应和 USB 配置导出；没有 Mac 阅读日志导入或时长上传功能。</p>
-<p class="note">当前为 PW2 / 5.12.2.1.1 实验预览。首次设置需越狱、KUAL 和兼容性核验。导出的配置始终关闭自动上传；真机性能、休眠与真实入账验收通过后才能另行开启。</p>
-<section><h2>1. 选择安装方式</h2><p>用过网页版时，填写保存真实账号及账本的旧项目目录。不要选择新的空克隆。交接会封锁该旧实例写入，保留未核验记录。</p>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kindle 自动同步 · 书籍对应</title>
+<style>body{max-width:920px;margin:38px auto;padding:0 22px;background:#f6f5ef;color:#243d32;font:15px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}h1{font-size:28px}h2{font-size:21px}section{padding:22px 26px;border:1px solid #dbe1d6;border-radius:12px;background:#fffefa;margin:20px 0}button{font:inherit;border-radius:7px;border:1px solid #b7cbbd;padding:9px 16px;background:#285b45;color:#fff;cursor:pointer;margin:4px 10px 4px 0}button:disabled{opacity:.4;cursor:default}a{color:#285b45}.note{background:#f7f0db;padding:14px;border-radius:7px}.muted{color:#68786d}.error{color:#9b4940}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}img{max-width:240px}label{display:block;margin:12px 0}input[type=text],textarea{box-sizing:border-box;width:100%;font:inherit;border:1px solid #b7cbbd;border-radius:5px;padding:9px}select{box-sizing:border-box;width:100%;font:inherit;padding:10px;border:1px solid #b7cbbd;border-radius:6px;background:#fff} .book-row{border-top:1px solid #e0e5dc;padding:12px 0} .book-row p{margin:4px 0} #candidateMessage{white-space:pre-wrap} textarea{min-height:200px;font-family:monospace}code{overflow-wrap:anywhere}</style></head><body>
+<h1>Kindle 自动同步 · 书籍对应</h1><p class="muted">这是 Kindle 端项目的配置助手。它提供专用扫码、旧实例交接、准确书籍对应和 USB 配置导出；没有 Mac 阅读日志导入或时长上传功能。</p>
+<p class="note">这里可以一次选好几本新书，核对微信读书版本并保存到本机。候选清单部署到 Kindle 后才会用于自动同步。</p>
+<section id="bookPicker"><h2>给新书选择微信读书版本</h2>
+<p>先选 Kindle 里的书，再搜索并核对微信读书的作者和版本。保存后的候选对应留在本机，页面会列出待部署清单。</p>
+<button id="refreshBooks">刷新 Kindle 候选书</button>
+<label>Kindle 候选书<select id="kindleBook"><option value="">请选择一本书</option></select></label><p id="candidateInfo" class="muted"></p>
+<label>搜索微信读书<input id="bookKeyword" type="text" placeholder="书名或作者"></label>
+<button id="findBook">搜索版本</button>
+<label>微信读书目标版本<select id="wereadBook"><option value="">先搜索，再选择具体版本</option></select></label><p id="targetInfo" class="muted"></p>
+<label><input type="checkbox" id="confirmCandidate">我已核对作者与版本，确认这两边是同一本书。</label>
+<button id="saveCandidate" disabled>确认并保存对应</button>
+<p id="candidateMessage" role="status"></p>
+<details open><summary>这台 Kindle 的对应清单</summary><div id="candidateList"></div></details>
+<p class="note">候选对应保存到 Mac 后，仍需取得设备的精确来源标识并部署到 Kindle。这里不会替换正在使用的配置或重新授权。可以一次选好几本，再集中部署。</p>
+</section>
+<details><summary>首次安装与高级配置</summary><section><h2>1. 选择安装方式</h2><p>用过网页版时，填写保存真实账号及账本的旧项目目录。不要选择新的空克隆。交接会封锁该旧实例写入，保留未核验记录。</p>
 <label>旧项目目录<input type="text" id="legacyPath" placeholder="/path/to/your/existing/project"></label><button id="legacy">选择已有网页版实例</button>
 <label><input type="checkbox" id="newConfirm">这是全新安装；我没有其他 Mac 或 Kindle 上传实例。</label><button id="fresh">选择全新安装</button><p id="sourceState"></p></section>
 <section><h2>2. 设备与专用扫码</h2><p id="probe"></p><button id="refresh">刷新连接及导出状态</button><details><summary>兼容性、自检及服务快照</summary><pre id="probeDetail"></pre></details><p id="authState"></p><button id="login">生成 Kindle 专用二维码</button><div id="qr"></div><p id="loginState"></p></section>
@@ -13,9 +26,9 @@
 <p>按作者和版本核对目标。下面 JSON 每项为 <code>local_book_id</code>、<code>weread_book_id</code>、<code>title</code>。本地 ID 来自解析结果，不能只按相似标题猜测。</p>
 <input type="file" id="mappingFile" accept="application/json,.json"><textarea id="mappings" aria-label="书籍对应 JSON">[]</textarea><button id="saveMappings">保存书籍对应</button></section>
 <section><h2>4. 导出配置</h2><p class="note">USB/FAT 暂存不具备私有文件权限保护。请在自己的电脑上导出，安全弹出后及时在 KUAL 选择 Import USB configuration；成功导入会删除暂存凭据。空对应仅用于首次采集识别新书。修改书籍对应会使旧验收绑定失效。</p><label><input type="checkbox" id="exportConfirm">我确认把 Kindle 专用凭据和已保存的对应暂存到当前设备；自动上传保持关闭。</label><button id="export" disabled>导出设备配置</button><p id="exportState"></p></section>
-<section><h2>设备导出的状态</h2><p>在 KUAL 选 Export sanitized status，接回后刷新。这里是已导出的快照，不能当作设备实时状态。</p><pre id="deviceState"></pre></section><p id="message" role="status"></p>
+</details><section><h2>设备导出的状态</h2><p>在 KUAL 选 Export sanitized status，接回后刷新。这里是已导出的快照，不能当作设备实时状态。</p><pre id="deviceState"></pre></section><p id="message" role="status"></p>
 <script>
-'use strict';const $=id=>document.getElementById(id);let csrf=null,state=null,timer=null,dirty=false;
+'use strict';const $=id=>document.getElementById(id);let csrf=null,state=null,timer=null,dirty=false,candidates=[],targets=[];
 async function api(path,body){const headers={};if(body!==undefined){if(!csrf)csrf=(await api('/api/bootstrap')).csrf_token;headers['Content-Type']='application/json';headers['X-CSRF-Token']=csrf;}const r=await fetch(path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',credentials:'same-origin'});const v=await r.json();if(!r.ok||v.ok===false){if(r.status===403)csrf=null;throw new Error(v.error||'操作未完成');}return v.data??v;}
 function message(text,error=false){$('message').textContent=text;$('message').className=error?'error':'';}
 function buttons(){const fenced=!!state?.mac_upload_fenced;$('handoff').disabled=fenced||!state?.device_auth_ready||!state?.source||state.source.mode==='unselected'||!$('handoffConfirm').checked;$('export').disabled=!fenced||!state?.device_auth_ready||!state?.usb?.connected||!$('exportConfirm').checked;$('legacy').disabled=fenced;$('fresh').disabled=fenced;}
@@ -33,6 +46,71 @@ $('mappings').oninput=()=>dirty=true;$('mappingFile').onchange=async()=>{try{con
 action('saveMappings',async()=>{const result=await api('/api/mappings/save',{mappings:JSON.parse($('mappings').value)});dirty=false;await refresh();message(`已保存 ${result.mappings_count} 本书的对应。`);});
 action('export',async()=>{const result=await api('/api/device/config',{confirmed:$('exportConfirm').checked});$('exportState').textContent=`已暂存 ${result.mappings_count} 本书的对应和专用凭据。请安全弹出并在KUAL导入；自动上传仍关闭。`;await refresh();});
 $('handoffConfirm').onchange=buttons;$('exportConfirm').onchange=buttons;
-if(location.protocol==='file:'){message('请运行配置助手，通过 http://127.0.0.1:8766 打开。',true);document.querySelectorAll('button').forEach(b=>b.disabled=true);}else refresh().catch(e=>message(e.message,true));
+function candidateMessage(text,error=false){$('candidateMessage').textContent=text;$('candidateMessage').className=error?'error':'';}
+function pickedCandidate(){return candidates.find(book=>book.candidate_id===$('kindleBook').value);}
+function pickedTarget(){return targets.find(book=>book.bookId===$('wereadBook').value);}
+function pickerButtons(){$('saveCandidate').disabled=!pickedCandidate()||!pickedTarget()||!$('confirmCandidate').checked;}
+function clearTargets(){targets=[];$('wereadBook').replaceChildren(new Option('先搜索，再选择具体版本',''));$('targetInfo').textContent='';$('confirmCandidate').checked=false;pickerButtons();}
+function showCandidate(){
+ const book=pickedCandidate();clearTargets();
+ $('candidateInfo').textContent=book?[book.author,book.local_book_id?'已取得原生来源标识':'候选文件，首次原生阅读后才能核验来源',book.mapping?'当前对应 '+book.mapping.title:''].filter(Boolean).join(' · '):'';
+ $('bookKeyword').value=(book?.title||'').split(/[（(【]/)[0].trim().slice(0,100);
+ if(book?.saved)candidateMessage('已保存候选对应 → '+book.saved.target.title+'。待统一部署到 Kindle。');else candidateMessage('');
+}
+function renderCandidateList(){
+ const list=$('candidateList');list.replaceChildren();
+ for(const book of candidates.filter(book=>book.mapping||book.saved)){
+  const row=document.createElement('div');row.className='book-row';
+  const title=document.createElement('strong');title.textContent=book.title;row.append(title);
+  const text=document.createElement('p');
+  text.textContent=book.saved?'候选已保存，待部署 → '+book.saved.target.title+(book.saved.target.author?' · '+book.saved.target.author:''):'已有对应 → '+book.mapping.title;
+  row.append(text);list.append(row);
+ }
+ if(!list.childElementCount)list.textContent='尚未保存对应。';
+}
+async function refreshCandidates(){
+ const previous=$('kindleBook').value;
+ const result=await api('/api/books');candidates=result.books||[];
+ $('kindleBook').replaceChildren(new Option('请选择一本书',''));
+ candidates.forEach(book=>{
+  const mark=book.saved?'【待部署】':book.mapping?'【已有对应】':'【未匹配】';
+  $('kindleBook').add(new Option(mark+' '+book.title+(book.author?' · '+book.author:''),book.candidate_id));
+ });
+ if(candidates.some(book=>book.candidate_id===previous))$('kindleBook').value=previous;
+ showCandidate();renderCandidateList();
+ if(!result.connected)candidateMessage('请先将 Kindle 用 USB 接上 Mac。');
+ else if(result.truncated)candidateMessage('已列出前 200 本候选书。');
+}
+action('refreshBooks',refreshCandidates);
+$('kindleBook').onchange=showCandidate;
+$('wereadBook').onchange=()=>{
+ const book=pickedTarget();$('confirmCandidate').checked=false;
+ $('targetInfo').textContent=book?[book.author,book.publisher,book.isbn?'ISBN '+book.isbn:'','书籍 ID '+book.bookId].filter(Boolean).join(' · '):'';
+ pickerButtons();
+};
+$('confirmCandidate').onchange=pickerButtons;
+action('findBook',async()=>{
+ const keyword=$('bookKeyword').value.trim();if(!keyword)throw new Error('请输入书名或作者。');
+ const candidate=$('kindleBook').value;clearTargets();$('findBook').disabled=true;
+ candidateMessage('正在查询微信读书版本…');
+ try{
+  const result=await api('/api/search',{keyword});
+  if(candidate!==$('kindleBook').value)return;
+  targets=result.books||[];
+  $('wereadBook').replaceChildren(new Option(targets.length?'请选择准确版本':'没有找到结果，请换书名或作者',''));
+  targets.forEach(book=>$('wereadBook').add(new Option(book.title+' · '+(book.author||'作者未提供')+' · ID '+book.bookId,book.bookId)));
+  candidateMessage(targets.length?'找到 '+targets.length+' 个版本，请核对后选择。':'没有找到对应版本。个人导入书请先在微信读书里完成导入。');
+ }catch(error){candidateMessage(error.message,true);}finally{$('findBook').disabled=false;}
+});
+action('saveCandidate',async()=>{
+ const book=pickedCandidate(),target=pickedTarget();if(!book||!target||!$('confirmCandidate').checked)return;
+ $('saveCandidate').disabled=true;
+ try{
+  const result=await api('/api/books/save',{candidate_id:book.candidate_id,target,confirmed:true});
+  await refreshCandidates();
+  candidateMessage('已保存「'+result.candidate.title+'」→「'+target.title+'」。'+(result.awaiting_native_identity?'待首次原生阅读识别后统一部署。':'待统一部署到 Kindle。'));
+ }catch(error){candidateMessage(error.message,true);}finally{pickerButtons();}
+});
+if(location.protocol==='file:'){message('请运行配置助手，通过 http://127.0.0.1:8766 打开。',true);document.querySelectorAll('button').forEach(b=>b.disabled=true);}else Promise.all([refresh(),refreshCandidates()]).catch(e=>message(e.message,true));
 window.addEventListener('pagehide',()=>{if(timer)clearInterval(timer);});
 </script></body></html>
