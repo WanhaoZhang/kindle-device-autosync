@@ -29,6 +29,7 @@ fn run() -> Result<serde_json::Value> {
                 "sync",
                 "status",
                 "import-config",
+                "import-book-candidates",
                 "export",
                 "reconcile",
                 "operate",
@@ -73,6 +74,7 @@ fn run() -> Result<serde_json::Value> {
         "reconcile" => {
             manual::reconcile_manual(&store, &value("--plan-id")?, &mut network::Live::default())
         }
+        "import-book-candidates" => book_mappings::import(&store, Path::new(&value("--inbox")?)),
         "import-config" => import_config(&store, Path::new(&value("--inbox")?)),
         "export" => export(&store, Path::new(&value("--out")?)),
         "collect" => parsing::collect(

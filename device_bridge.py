@@ -300,6 +300,10 @@ def status(project_root, mount='/Volumes/Kindle'):
             for key,allowed in [('reader_state',('active','idle','unknown')),('power_state',('awake','sleeping','unknown'))]:
                 if raw.get(key) in allowed:safe[key]=raw[key]
             value['device_status']['capture']=safe
+        if isinstance(exported.get('book_candidates'),dict):
+            count=exported['book_candidates'].get('saved_candidates')
+            if type(count) is int and 0<=count<=200:
+                value['device_status']['book_candidates']={'saved_candidates':count}
         for key in ('configured','collect_only_default','auto_sync_enabled'):
             if type(exported.get(key)) is bool:value['device_status'][key]=exported[key]
         if isinstance(exported.get('states'),dict):

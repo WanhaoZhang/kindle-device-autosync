@@ -16,6 +16,9 @@ The pinned `5423150` maintenance action is no longer in the default menu. Its op
 
 The current default menu provides:
 
+- **Import selected books + export status**: imports the explicitly selected batch from the Mac helper in one action. Previously enabled authorization and the base config remain intact. Unread candidates wait for exact native counter evidence.
+
+
 - **First install + import + protect + reboot**: for a fresh installation with USB config staged, in airplane mode. It groups the compatibility probe, collection-only install, installed filesystem self-test, import, OTA guard, collection enable and reboot. See the [quickstart](../../docs/QUICKSTART.md) for the full sequence and how to stage trial requests.
 
 - **Setup stopped preview + import + reboot**: a verified low-space replacement of the disabled/unconfigured preview, local self-test, import, OTA protection, collection startup, then an explicit reboot. Keep airplane mode until the protection has been verified after that reboot.

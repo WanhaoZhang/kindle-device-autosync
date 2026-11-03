@@ -152,6 +152,28 @@ class DeviceAppTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.app.dispatch('/api/books/save', {**request,'confirmed':True})
 
+    def test_batch_candidate_export_requires_capability_and_retains_existing_configuration(self):
+        book = self.mount/'documents/Candidate.mobi'
+        book.write_bytes(b'synthetic')
+        self.app.dispatch('/api/books/save', {'candidate_id':'documents/Candidate.mobi',
+            'target':{'bookId':'456','title':'Chosen version'},'confirmed':True})
+        status = self.mount/'.kindle-native-sync-export/status.json'
+        self.write(status, {'binding_sha256':'a'*64})
+        with self.assertRaises(ValueError):
+            self.app.export_candidates(True)
+        self.write(status, {'binding_sha256':'a'*64,'book_candidates':{'saved_candidates':0}})
+        with self.assertRaises(ValueError):
+            self.app.export_candidates(False)
+        result = self.app.export_candidates(True)
+        self.assertEqual(result['candidate_count'],1)
+        self.assertFalse(result['credentials_exported'])
+        request = json.loads((self.mount/'.kindle-native-sync-book-inbox/request.json').read_text())
+        self.assertEqual(request['entries'][0]['target']['bookId'],'456')
+        self.assertNotIn('SYNTHETIC_ACCESS',json.dumps(request))
+        self.assertFalse((self.mount/'.kindle-native-sync-inbox').exists())
+        with self.assertRaises(ValueError):
+            self.app.export_candidates(True)
+
     def test_http_guards_and_no_import_or_time_upload_routes(self):
         server=device_app.ThreadingHTTPServer(('127.0.0.1',0),device_app.make_handler(self.app));port=server.server_address[1]
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()

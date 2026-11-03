@@ -93,7 +93,7 @@ static inline int ksync_restrict_private_state(const char *root, uid_t owner) {
   static const char *files[] = {
     "config.json", "auth.json", "runtime.json", "validation-tls.json",
     "experimental-authorization.json", "validation-device.json",
-    "collection-state.json", "sidecar-index.json", "catalog-index.json",
+    "book-candidates.json", "collection-state.json", "sidecar-index.json", "catalog-index.json",
     "worker.lock", "collector.lock", "collector.checkpoint", "ledger.sqlite",
     "ledger.sqlite-journal", "ledger.sqlite-wal", "ledger.sqlite-shm", "disabled",
     "readonly-recheck.pending"

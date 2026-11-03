@@ -124,3 +124,11 @@ PW2 统一存储 profile：SQLite `page_size=4096,max_page_count=1024`，账本�
 已收到明确 ack 的上传最多执行 8 轮只读回查，间隔约 2 秒，仅在增量为 0 或预期秒数且位置未变时继续；30 秒以后不启动新轮，单轮两个请求各有 20 秒限时。取消时收尾当前一对 GET。自然唤醒或联网后的下次同步会先只读复核待核验 ack，精确匹配后才继续新上传；unknown 和未确认回执不会被自动重发。延迟复核成功时保留 `original_after/original_day_after`，并将真实新 GET 保存为 canonical `after/day_after`。
 
 若确认回执对应的书籍或日期统计仍在等待刷新，worker 会尝试创建私有零字节 `readonly-recheck.pending` 提示。采集器安全消费后，仅在设备仍醒着、已联网且明确退出阅读并空闲时，于 60 秒后再运行只读核验；不设置 RTC、不主动联网、不阻止休眠。未知结果、异常增量或位置变化不创建提示。手动 KUAL worker 返回后用固定控制 `maintenance check-readonly-hint` 通知采集器检查提示，控制本身不改变电源、网络、阅读或缺口状态。
+
+## 追加新书对应
+
+`import-book-candidates --inbox DIR` 读取 schema 1 的 `request.json`，字段为 `binding_sha256` 和 `entries`。entries 使用 Mac 候选清单中的 candidate_id、title、author、target。target 包含 bookId、title、author、publisher、isbn。原配置与授权保持原绑定；注册表保存在私有 `book-candidates.json`，仅允许新增或相同目标的重复导入，拒绝修改既有目标及重复文件来源键。
+
+准备和发送都会重新核验有效对应。原生会话、唯一 sidecar 计数和现存文件目录尚未吻合时，候选不会成为有效来源。普通配置变更仍会撤销旧绑定；追加入口不允许改动账号、原映射、起始时间、性能或协议验收。
+
+同一 `confirm-enable` 请求在原试传已经进入账本时只做只读核验，未提交过才走一次时长 POST。未知回执不能重放。这样可以在一次拔线期间等待服务端延迟统计，而不必返回 Mac 重建试传。

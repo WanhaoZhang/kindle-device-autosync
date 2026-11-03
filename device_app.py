@@ -160,6 +160,33 @@ class DeviceApp:
         return {'state': 'candidate_saved', 'candidate': rows[-1],
                 'device_updated': False, 'awaiting_native_identity': candidate['local_book_id'] is None}
 
+    def export_candidates(self, confirmed):
+        if confirmed is not True:
+            raise ValueError('请先确认将候选对应交给当前 Kindle。')
+        if not bridge.probe_usb(self.mount)['connected']:
+            raise ValueError('Kindle 未连接。')
+        status = bridge._read(self.mount/'.kindle-native-sync-export/status.json')
+        if not isinstance(status.get('book_candidates'), dict):
+            raise ValueError('请先安装 Preview 0.2.0 或更新设备包，并导出一次设备状态。')
+        binding = status.get('binding_sha256')
+        import re
+        if not isinstance(binding, str) or not re.fullmatch(r'[0-9a-f]{64}', binding):
+            raise ValueError('需要一次设备状态导出以核对当前配置。')
+        candidates = [row['saved'] for row in self.book_candidates()['books'] if row['saved']]
+        if not candidates:
+            raise ValueError('尚未保存任何候选对应。')
+        body = {'schema_version': 1, 'binding_sha256': binding, 'entries': candidates}
+        inbox = self.mount/'.kindle-native-sync-book-inbox'
+        if inbox.is_symlink():
+            raise ValueError('候选暂存目录不能是符号链接。')
+        inbox.mkdir(exist_ok=True)
+        request = inbox/'request.json'
+        if request.exists() or request.is_symlink():
+            raise ValueError('上次候选尚未导入，请先在 Kindle 完成导入。')
+        bridge._stage_write(request, body)
+        return {'state': 'staged', 'candidate_count': len(candidates),
+                'credentials_exported': False, 'device_updated': False}
+
     def start_login(self):
         if self.login_process and self.login_process.poll() is None:return self.login_status()
         if (self.private/'device-auth.json').exists():raise ValueError('已有 Kindle 专用凭据。不会在此隐藏切换设备身份；重新授权请先按维护说明核对账本。')
@@ -189,6 +216,7 @@ class DeviceApp:
     def dispatch(self, path, body):
         with self.lock:
             if path=='/api/books/save':return self.save_candidate(body)
+            if path=='/api/books/export':return self.export_candidates(body.get('confirmed'))
             if path=='/api/source':return self.select_source(body)
             if path=='/api/device/login':return self.start_login()
             if path=='/api/mappings/save':return self.mappings(body.get('mappings'))

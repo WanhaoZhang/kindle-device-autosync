@@ -13,7 +13,9 @@
 <button id="saveCandidate" disabled>确认并保存对应</button>
 <p id="candidateMessage" role="status"></p>
 <details open><summary>这台 Kindle 的对应清单</summary><div id="candidateList"></div></details>
-<p class="note">候选对应保存到 Mac 后，仍需取得设备的精确来源标识并部署到 Kindle。这里不会替换正在使用的配置或重新授权。可以一次选好几本，再集中部署。</p>
+<label><input type="checkbox" id="confirmCandidateExport">我确认将保存的候选对应交给当前 Kindle。</label>
+<button id="exportCandidates">导出候选对应到 Kindle</button>
+<p class="note">安装 Preview 0.2.0 或更新版本后，导出并安全弹出，在 KUAL 点 Import selected books + export status。未读候选会等到首次原生阅读并取得精确计数身份后启用。可一次导入多本。</p>
 </section>
 <details><summary>首次安装与高级配置</summary><section><h2>1. 选择安装方式</h2><p>用过网页版时，填写保存真实账号及账本的旧项目目录。不要选择新的空克隆。交接会封锁该旧实例写入，保留未核验记录。</p>
 <label>旧项目目录<input type="text" id="legacyPath" placeholder="/path/to/your/existing/project"></label><button id="legacy">选择已有网页版实例</button>
@@ -55,7 +57,7 @@ function showCandidate(){
  const book=pickedCandidate();clearTargets();
  $('candidateInfo').textContent=book?[book.author,book.local_book_id?'已取得原生来源标识':'候选文件，首次原生阅读后才能核验来源',book.mapping?'当前对应 '+book.mapping.title:''].filter(Boolean).join(' · '):'';
  $('bookKeyword').value=(book?.title||'').split(/[（(【]/)[0].trim().slice(0,100);
- if(book?.saved)candidateMessage('已保存候选对应 → '+book.saved.target.title+'。待统一部署到 Kindle。');else candidateMessage('');
+ if(book?.saved)candidateMessage('已保存候选对应 → '+book.saved.target.title+'。待批量导出并在 Kindle 导入。');else candidateMessage('');
 }
 function renderCandidateList(){
  const list=$('candidateList');list.replaceChildren();
@@ -108,8 +110,14 @@ action('saveCandidate',async()=>{
  try{
   const result=await api('/api/books/save',{candidate_id:book.candidate_id,target,confirmed:true});
   await refreshCandidates();
-  candidateMessage('已保存「'+result.candidate.title+'」→「'+target.title+'」。'+(result.awaiting_native_identity?'待首次原生阅读识别后统一部署。':'待统一部署到 Kindle。'));
+  candidateMessage('已保存「'+result.candidate.title+'」→「'+target.title+'」。'+(result.awaiting_native_identity?'待首次原生阅读识别后统一部署。':'待批量导出并在 Kindle 导入。'));
  }catch(error){candidateMessage(error.message,true);}finally{pickerButtons();}
+});
+action('exportCandidates',async()=>{
+ try{
+  const result=await api('/api/books/export',{confirmed:$('confirmCandidateExport').checked});
+  candidateMessage('已暂存 '+result.candidate_count+' 本候选。安全弹出后，在 KUAL 点 Import selected books + export status。需要设备 Preview 0.2.0 或更新版本。');
+ }catch(error){candidateMessage(error.message,true);}
 });
 if(location.protocol==='file:'){message('请运行配置助手，通过 http://127.0.0.1:8766 打开。',true);document.querySelectorAll('button').forEach(b=>b.disabled=true);}else Promise.all([refresh(),refreshCandidates()]).catch(e=>message(e.message,true));
 window.addEventListener('pagehide',()=>{if(timer)clearInterval(timer);});

@@ -1,5 +1,6 @@
 //! One-shot device worker. No UI, no background thread, no wake/Wi-Fi control.
 //! SPDX-License-Identifier: AGPL-3.0-only
+pub mod book_mappings;
 pub mod experimental;
 pub mod manual;
 pub mod network;
@@ -573,6 +574,7 @@ impl Store {
                 out["configured"] = json!(true);
                 out["authenticated"] = json!(authenticated);
                 out["account_hash"] = json!(c.account_hash());
+                out["book_candidates"] = book_mappings::summary(self, &c)?;
                 out["binding_sha256"] = json!(binding);
                 out["auto_sync_enabled"] = json!(enabled);
                 out["validation"] =
@@ -931,6 +933,7 @@ pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64)
     let rt = gate(&store.root, false, now())?;
     let c = Config::load(&store.root)?;
     store.bind(&c)?;
+    let mappings = book_mappings::resolved(store, &c)?;
     let effective_cutoff = c.bootstrap_cutoff_unix.max(rt.bootstrap_unix);
     let Some(scopes) = unresolved_scopes(store, &c)? else {
         return Ok(json!({"state":"empty_or_blocked","network_write":false}));
@@ -969,7 +972,7 @@ pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64)
         if book.is_some_and(|b| b != local) {
             continue;
         }
-        let Some(mapping) = c.mappings.iter().find(|m| m.local_book_id == local) else {
+        let Some(mapping) = mappings.iter().find(|m| m.local_book_id == local) else {
             continue;
         };
         if scopes
@@ -1007,11 +1010,7 @@ pub fn prepare(store: &Store, book: Option<&str>, trial: bool, max_seconds: i64)
         return Ok(json!({"state":"empty_or_blocked","network_write":false}));
     }
     let (local, day) = group.unwrap();
-    let mapping = c
-        .mappings
-        .iter()
-        .find(|m| m.local_book_id == local)
-        .unwrap();
+    let mapping = mappings.iter().find(|m| m.local_book_id == local).unwrap();
     let mut hours = std::collections::BTreeMap::<i64, i64>::new();
     for s in &chosen {
         for h in s["hours"].as_array().context("missing hours")? {
@@ -1047,10 +1046,12 @@ fn verify_plan(store: &Store, c: &Config, plan: &Value, trial: bool) -> Result<(
         "plan configuration changed"
     );
     ensure!(
-        c.mappings.iter().any(
-            |m| Some(m.local_book_id.as_str()) == plan["local_book_id"].as_str()
-                && Some(m.weread_book_id.as_str()) == plan["weread_book_id"].as_str()
-        ),
+        book_mappings::resolved(store, c)?
+            .iter()
+            .any(
+                |m| Some(m.local_book_id.as_str()) == plan["local_book_id"].as_str()
+                    && Some(m.weread_book_id.as_str()) == plan["weread_book_id"].as_str()
+            ),
         "mapping changed"
     );
     let overlaps: i64 = store.db.query_row(

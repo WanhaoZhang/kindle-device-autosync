@@ -5,7 +5,10 @@
 **设备端实验预览，默认只采集。** 一台 Paperwhite 2 / 5.12.2.1.1 已验证原生采集、真实 TLS、同日短试传到账及后台提交。历史日期有成功回执但未入账的案例，性能与完整协议矩阵待验收。
 
 - [快速安装](docs/QUICKSTART.md) · 已有 KUAL 时把检查、安装和配置尽量合到同一轮，附预发布包。
+- [0.2.0 发布说明](docs/RELEASE_0.2.0.md) · 完整包、批量选书和验证范围。
 - [完整复现和排错记录](docs/PW2_REPRODUCTION.md) · 从原厂 PW2 开始，包含包版本、源码构建、实机观察和异常恢复。
+
+Preview 0.2.0 新增网页批量选书和设备追加导入。完整安装 ZIP 同时附 Mac 助手源码与 ARM 设备包，普通使用无需本机编译。新书可以在一次 USB 连接上选好，拔线后统一导入，来源确认后参与自动同步。新追加导入已通过离线回归，尚未完成真机验收；915 秒实机到账记录来自前一版队列程序。
 
 ## 与网页版的区别
 
@@ -14,7 +17,7 @@
 | 本仓库 [kindle-device-autosync](https://github.com/WanhaoZhang/kindle-device-autosync) | Kindle 常驻采集、按需解析与直传；附带首次设置和维护用的 Mac 配置助手 |
 | [kindle-native-reading-sync](https://github.com/WanhaoZhang/kindle-native-reading-sync) | Mac 网页版：USB 导入 Kindle 日志、查看每日统计、人工核对后同步 |
 
-本仓库不包含网页版的日志导入、统计报告和 Mac 上传页面。首次配置助手用于独立扫码、书籍映射、上传权交接和读取导出的诊断，不在 Mac 提交阅读时长。两个仓库可分别克隆、运行和维护。拆分来源见 [仓库拆分说明](docs/REPOSITORY_SPLIT.md)。
+本仓库不包含网页版的日志导入、统计报告和 Mac 上传页面。首次配置助手用于独立扫码、候选书籍批量对应、上传权交接和读取导出的诊断，不在 Mac 提交阅读时长。两个仓库可分别克隆、运行和维护。拆分来源见 [仓库拆分说明](docs/REPOSITORY_SPLIT.md)。
 
 ## 运行方式
 

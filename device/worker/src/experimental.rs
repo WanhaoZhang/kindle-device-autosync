@@ -335,6 +335,8 @@ pub fn resume_isolated_autosync(store: &Store) -> Result<Value> {
 
 fn resume_isolated_with_probe(store: &Store, probe: &Value) -> Result<Value> {
     const PRIOR_WORKER: &str = "f327c8bfc6605093a413aff88462c2056f36c54f74cb3e6e3669268803d22350";
+    const PRIOR_QUEUE_WORKER: &str =
+        "2a9bf65ac2b14d45fe73d32a22b87d7135dff4e1713bca0bc6d3f5c745a176e7";
     let c = Config::load(&store.root)?;
     actual_supported(probe)?;
     store.bind(&c)?;
@@ -344,7 +346,8 @@ fn resume_isolated_with_probe(store: &Store, probe: &Value) -> Result<Value> {
     if prior["worker_sha256"] == current["worker_sha256"] {
         checked_authorization(&store.root, &c, &probe, true)?;
         ensure!(
-            prior["queue_upgrade"]["previous_worker_sha256"] == PRIOR_WORKER,
+            prior["queue_upgrade"]["previous_worker_sha256"] == PRIOR_WORKER
+                || prior["queue_upgrade"]["previous_worker_sha256"] == PRIOR_QUEUE_WORKER,
             "existing authorization is not from this upgrade"
         );
         return Ok(json!({"state":"isolated_autosync_resumed"}));
@@ -357,7 +360,7 @@ fn resume_isolated_with_probe(store: &Store, probe: &Value) -> Result<Value> {
         );
     }
     ensure!(
-        prior["worker_sha256"] == PRIOR_WORKER
+        (prior["worker_sha256"] == PRIOR_WORKER || prior["worker_sha256"] == PRIOR_QUEUE_WORKER)
             && prior["mode"] == "auto"
             && prior["accept_unverified_performance"] == true
             && prior["accept_unverified_protocol"] == true
@@ -376,8 +379,9 @@ fn resume_isolated_with_probe(store: &Store, probe: &Value) -> Result<Value> {
     let original = &adoption["prior_authorization"];
     legacy_authorization(&c, &probe, original)?;
     verified_trial(store, &c, id, original)?;
+    let previous_worker = prior["worker_sha256"].clone();
     prior["worker_sha256"] = current["worker_sha256"].clone();
-    prior["queue_upgrade"] = json!({"previous_worker_sha256":PRIOR_WORKER,"enabled_unix":now()});
+    prior["queue_upgrade"] = json!({"previous_worker_sha256":previous_worker,"enabled_unix":now()});
     atomic_json(&store.root.join(AUTHORIZATION), &prior)?;
     Ok(json!({"state":"isolated_autosync_resumed"}))
 }
@@ -628,7 +632,18 @@ pub fn operate(store: &Store, inbox: &Path, action: &str) -> Result<Value> {
                 .as_deref()
                 .context("missing exact plan id")?;
             let mut transport = network::Live::default();
-            let mut receipt = manual::commit_manual(store, id, true, &mut transport)?;
+            let attempted: bool = store.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?)",
+                [id],
+                |r| r.get(0),
+            )?;
+            // The same reviewed action is reusable after a delayed response.
+            // An existing attempt is reconciled, never submitted again.
+            let mut receipt = if attempted {
+                manual::reconcile_manual(store, id, &mut transport)?
+            } else {
+                manual::commit_manual(store, id, true, &mut transport)?
+            };
             if receipt["state"] == "confirmed" {
                 receipt["experimental_activation"] = enable(store, &c, id, true)?;
                 // We still own the Store lock: an adapter-triggered second
@@ -883,8 +898,15 @@ mod tests {
         assert!(checked_authorization(t.path(), &c, &p, true).is_ok());
         resume_isolated_with_probe(&s, &p).unwrap();
         assert_eq!(s.status().unwrap()["attempts"], 1);
-        let state: String = s.db.query_row("SELECT state FROM attempts WHERE id=?", [&id], |r| r.get(0)).unwrap();
+        let state: String =
+            s.db.query_row("SELECT state FROM attempts WHERE id=?", [&id], |r| r.get(0))
+                .unwrap();
         assert_eq!(state, "confirmed");
+        adopted["worker_sha256"] =
+            json!("2a9bf65ac2b14d45fe73d32a22b87d7135dff4e1713bca0bc6d3f5c745a176e7");
+        atomic_json(&t.path().join(AUTHORIZATION), &adopted).unwrap();
+        resume_isolated_with_probe(&s, &p).unwrap();
+        assert!(checked_authorization(t.path(), &c, &p, true).is_ok());
         adopted["mode"] = json!("trial");
         atomic_json(&t.path().join(AUTHORIZATION), &adopted).unwrap();
         assert!(resume_isolated_with_probe(&s, &p).is_err());

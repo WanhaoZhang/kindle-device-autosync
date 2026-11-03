@@ -162,6 +162,9 @@ case "${1:-probe}" in
     [ -f "$PACKAGE/ota/control.sh" ] || exit 1
     run_ota require-ready ota-status.json
     run_installed tls-selftest.json self-test --online-self-test;;
+ import-book-candidates)
+    run_installed book-candidate-import.json import-book-candidates --inbox /mnt/us/.kindle-native-sync-book-inbox
+    sh "$ROOT/install/control.sh" export;;
  verify-setup)
     run_ota require-ready ota-status.json
     sh "$ROOT/install/control.sh" export;;

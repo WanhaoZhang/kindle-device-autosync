@@ -11,6 +11,7 @@ UPDATE=$USB/.kindle-native-sync-queue-update
 OUT=$USB/.kindle-native-sync-export
 EXT=$USB/extensions/kindle-native-sync
 OLD_SHA=f327c8bfc6605093a413aff88462c2056f36c54f74cb3e6e3669268803d22350
+QUEUE_SHA=2a9bf65ac2b14d45fe73d32a22b87d7135dff4e1713bca0bc6d3f5c745a176e7
 WORKER=$ROOT/bin/ksync-worker
 NEXT=$ROOT/bin/ksync-worker.queue-next
 BACKUP=$ROOT/bin/ksync-worker.pre-queue-update
@@ -43,17 +44,17 @@ regular "$UPDATE/ksync-worker" && regular "$UPDATE/SHA256SUMS" && regular "$WORK
 candidate_sha=$(digest "$UPDATE/ksync-worker")
 [ "$(cat "$UPDATE/SHA256SUMS")" = "$candidate_sha  ksync-worker" ]
 installed_sha=$(digest "$WORKER")
-[ "$installed_sha" = "$OLD_SHA" ] || [ "$installed_sha" = "$candidate_sha" ]
+[ "$installed_sha" = "$OLD_SHA" ] || [ "$installed_sha" = "$QUEUE_SHA" ] || [ "$installed_sha" = "$candidate_sha" ]
 for marker in .verified-runtime-upgrade .component-repair .preview-upgrade .install-transaction disabled;do
     [ ! -e "$ROOT/$marker" ] && [ ! -L "$ROOT/$marker" ]
 done
 sh "$PACKAGE/ota/control.sh" require-ready >/dev/null
 [ "$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null)" = CONNECTED ]
 
-if [ "$installed_sha" = "$OLD_SHA" ];then
+if [ "$installed_sha" != "$candidate_sha" ];then
     stage=stage_worker
     [ ! -L "$NEXT" ] && [ ! -L "$BACKUP" ]
-    if [ -e "$BACKUP" ];then regular "$BACKUP" && [ "$(digest "$BACKUP")" = "$OLD_SHA" ]
+    if [ -e "$BACKUP" ];then regular "$BACKUP" && { [ "$(digest "$BACKUP")" = "$OLD_SHA" ] || [ "$(digest "$BACKUP")" = "$QUEUE_SHA" ]; }
     else ln "$WORKER" "$BACKUP";fi
     if [ -e "$NEXT" ] && regular "$NEXT" &&
         [ "$(digest "$NEXT")" = 2841b2d6bdc446a7088954a3830d7094d601a0a3c23c044238844d1798010800 ];then
